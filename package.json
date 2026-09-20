@@ -1,0 +1,15 @@
+{
+  "name": "vwap",
+  "version": "0.1.0",
+  "description": "Non-custodial accumulation engine. Plans and schedules DCA/TWAP/VWAP buys across chains; never holds keys or funds.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=23.6" },
+  "bin": { "vwap": "./src/cli/index.ts" },
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "vwap": "node src/cli/index.ts"
+  },
+  "devDependencies": { "typescript": "^5.7.0", "@types/node": "^22.10.0" }
+}
