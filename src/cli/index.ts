@@ -14,7 +14,12 @@ import { decideSlicing } from '../core/planner.ts';
 import { iso, nextDayOfMonth, scheduleFor } from '../core/schedule.ts';
 import type { Token } from '../core/types.ts';
 import { DCA_FEE_BPS, type JupToken } from '../venues/jupiter/client.ts';
-import { auditToken, type TokenAudit } from '../venues/jupiter/safety.ts';
+import { auditToken, looksLikeMint, type TokenAudit } from '../venues/jupiter/safety.ts';
+import {
+  INTERVAL_SECONDS, MIN_ORDER_USD, OrderTooSmallError, chunkPeriods, createDcaOrder,
+} from '../venues/jupiter/orders.ts';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
   AmbiguousTokenError, USDC, makeQuoteFn, resolveToken, toToken,
 } from '../venues/jupiter/adapter.ts';
@@ -26,10 +31,12 @@ ${bold('vwap')} -- plan long-horizon accumulation, non-custodially.
 ${bold('USAGE')}
   vwap check <token...> [--per-buy <usd>] [--total <usd>]
   vwap plan  --legs <SYM=weight,...> --budget <usd> [options]
+  vwap order --legs <SYM=weight,...> --budget <usd> --wallet <pubkey> [options]
 
 ${bold('COMMANDS')}
   check    Resolve tokens and audit them for identity and liquidity risk.
   plan     Build a full schedule with measured impact and slicing decisions.
+  order    Build UNSIGNED DCA transactions for you to sign in your own wallet.
 
 ${bold('PLAN OPTIONS')}
   --legs <spec>       Comma list, e.g. "JUP=1,SOL=1,MET=1" or mint=weight.
@@ -40,9 +47,18 @@ ${bold('PLAN OPTIONS')}
   --slippage <bps>    Per-order slippage cap.      (default: 50)
   --json              Emit machine-readable JSON.
 
+${bold('ORDER OPTIONS')}
+  --wallet <pubkey>   Your PUBLIC key. Never pass a private key to this tool.
+  --chunk <n>         Split into consecutive orders of n periods each, so you
+                      do not escrow the whole plan at once.
+  --out <dir>         Where to write the unsigned transactions.
+
 ${bold('NOTES')}
   Tokens may be given as tickers or mint addresses. A ticker matching more than
   one token is an error, not a guess -- pass the mint to disambiguate.
+
+  'order' builds transactions and stops. It never signs, never submits, and
+  never asks for a secret key.
 `;
 
 // Annotated explicitly: TypeScript only narrows through a never-returning
@@ -228,6 +244,112 @@ async function cmdPlan(opts: {
   }
 }
 
+async function cmdOrder(opts: {
+  legs: string; budget: string; cadence: string; periods: number;
+  wallet: string; chunk?: number; out: string;
+}) {
+  const cadence = opts.cadence as 'daily' | 'weekly' | 'monthly';
+  if (!['daily', 'weekly', 'monthly'].includes(cadence)) fail(`bad cadence: ${opts.cadence}`);
+  // A Solana secret key is 64 bytes and base58-encodes to ~87-88 characters, so
+  // an over-long base58 string is almost certainly a secret. Check this BEFORE
+  // the generic format check, so the user gets the warning that matters.
+  if (/^[1-9A-HJ-NP-Za-km-z]{45,}$/.test(opts.wallet)) {
+    fail('that looks like a SECRET key, not a public key. Never pass a secret key to this tool -- it signs nothing and needs only your public address.');
+  }
+  if (!looksLikeMint(opts.wallet)) fail(`--wallet must be a base58 public key, got ${JSON.stringify(opts.wallet)}`);
+
+  const legSpecs = parseLegs(opts.legs);
+  const budget = parseUnits(opts.budget, USDC.decimals);
+  const budgetUsd = Number(formatUnits(budget, USDC.decimals));
+  const shares = splitByWeights(budget, legSpecs.map((l) => l.weight));
+  const chunks = chunkPeriods(opts.periods, opts.chunk);
+  const interval = INTERVAL_SECONDS[cadence];
+
+  // Validate every leg BEFORE building anything, so a plan either works whole
+  // or fails without leaving half its orders built.
+  for (const [i, leg] of legSpecs.entries()) {
+    const perOrderUsd = Number(formatUnits(shares[i]!, USDC.decimals));
+    if (perOrderUsd < MIN_ORDER_USD) {
+      const err = new OrderTooSmallError(perOrderUsd);
+      fail(`${leg.query}: ${err.message}`);
+    }
+  }
+
+  const firstChunkUsd = budgetUsd * chunks[0]!;
+  console.log(`\n${bold('Order')}  ${usd(budgetUsd)} ${cadence} x ${opts.periods} across ${legSpecs.length} legs`);
+  if (chunks.length > 1) {
+    console.log(dim(`split into ${chunks.length} consecutive orders of ${chunks[0]} periods each`));
+  }
+  console.log(
+    `${bold('Capital escrowed now:')} ${bold(usd(firstChunkUsd))}` +
+    (chunks.length > 1 ? dim(`  (of ${usd(budgetUsd * opts.periods)} total; the rest when each chunk ends)`) : ''),
+  );
+  console.log(dim('Jupiter locks the whole deposit when the order is created. It stays yours\nand is withdrawable by cancelling, but it is committed from today.'));
+
+  if (cadence === 'monthly') {
+    const driftDays = Math.round((opts.periods * (2_629_746 - INTERVAL_SECONDS.monthly)) / 86_400);
+    console.log(
+      `\n${yellow('note')} Jupiter schedules by fixed 30-day intervals, not calendar dates, so ` +
+      `buys\n     cannot be pinned to the 1st. Over ${opts.periods} orders they drift about ` +
+      `${driftDays} days earlier.\n     For averaging the date is immaterial, but it is not what "the 1st" means.`,
+    );
+  }
+  console.log();
+
+  await mkdir(opts.out, { recursive: true });
+  const written: string[] = [];
+
+  for (const [i, leg] of legSpecs.entries()) {
+    const { token: jup } = await resolveOrExplain(leg.query);
+    const audit = auditToken(jup, {
+      perBuyUsd: Number(formatUnits(shares[i]!, USDC.decimals)),
+      totalPositionUsd: Number(formatUnits(shares[i]!, USDC.decimals)) * opts.periods,
+    });
+    if (audit.verdict === 'blocked') {
+      printAudit(audit);
+      fail(`${jup.symbol} is blocked by the audit -- refusing to build an order for it`);
+    }
+
+    let offset = 0;
+    for (const [c, count] of chunks.entries()) {
+      const deposit = shares[i]! * BigInt(count);
+      const startAt = offset === 0 ? undefined : Math.floor(Date.now() / 1000) + offset * interval;
+      const built = await createDcaOrder({
+        user: opts.wallet,
+        inputMint: USDC.address,
+        outputMint: jup.id,
+        totalDeposit: deposit,
+        numberOfOrders: count,
+        intervalSeconds: interval,
+        ...(startAt !== undefined ? { startAt } : {}),
+      });
+      const name = `${jup.symbol}-${String(c + 1).padStart(2, '0')}.json`;
+      const file = join(opts.out, name);
+      await writeFile(file, JSON.stringify({
+        leg: jup.symbol, mint: jup.id, wallet: opts.wallet,
+        depositUsdc: formatUnits(deposit, USDC.decimals),
+        numberOfOrders: count, intervalSeconds: interval,
+        ...(startAt !== undefined ? { startAt } : {}),
+        requestId: built.requestId,
+        unsignedTransaction: built.transaction,
+      }, null, 2) + '\n');
+      written.push(file);
+      console.log(
+        `  ${green('built')} ${bold(jup.symbol.padEnd(8))} ${usd(Number(formatUnits(deposit, USDC.decimals)))} ` +
+        `over ${count} orders  ${dim(name)}`,
+      );
+      offset += count;
+    }
+  }
+
+  console.log(`\n${bold(`${written.length} unsigned transaction(s) written to ${opts.out}/`)}`);
+  console.log(dim(
+    '\nThese are UNSIGNED. Nothing has been submitted and no funds have moved.\n' +
+    'Review each one, then sign and send it from your own wallet. Place a single\n' +
+    'short order first and confirm it fills before committing the full plan.',
+  ));
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
@@ -246,6 +368,30 @@ async function main() {
         values['per-buy'] !== undefined ? Number(values['per-buy']) : undefined,
         values['total'] !== undefined ? Number(values['total']) : undefined,
       );
+      return;
+    }
+    if (cmd === 'order') {
+      const { values } = parseArgs({
+        args: argv.slice(1),
+        options: {
+          legs: { type: 'string' }, budget: { type: 'string' },
+          wallet: { type: 'string' },
+          cadence: { type: 'string', default: 'monthly' },
+          periods: { type: 'string', default: '48' },
+          chunk: { type: 'string' },
+          out: { type: 'string', default: 'orders' },
+        },
+      });
+      const legs = values.legs ?? fail('--legs is required');
+      const budget = values.budget ?? fail('--budget is required');
+      const wallet = values.wallet ?? fail('--wallet is required (your PUBLIC key)');
+      await cmdOrder({
+        legs, budget, wallet,
+        cadence: values.cadence ?? 'monthly',
+        periods: Number(values.periods ?? '48'),
+        ...(values.chunk !== undefined ? { chunk: Number(values.chunk) } : {}),
+        out: values.out ?? 'orders',
+      });
       return;
     }
     if (cmd === 'plan') {

@@ -1,0 +1,135 @@
+/**
+ * Building Jupiter DCA orders.
+ *
+ * This module builds UNSIGNED transactions and stops. It never signs, never
+ * submits, and never sees a private key -- placing an order is a deliberate act
+ * the user performs in their own wallet.
+ *
+ * A note on which API this targets. Jupiter's docs say DCA has moved into
+ * Trigger V2, and the Recurring API is unmaintained. But as of September 2026
+ * there is no public `trigger/v2/*` endpoint -- every path 404s -- and
+ * `trigger/v1/createOrder` is limit-orders-only (it requires `maker`/`payer`
+ * and price params). `recurring/v1/createOrder` is the only public endpoint
+ * that builds a working DCA order, so that is what this uses. When Trigger V2
+ * ships publicly, this is the module that changes; nothing in core/ should.
+ */
+import { JupiterError } from './client.ts';
+
+const LITE = 'https://lite-api.jup.ag';
+
+/**
+ * Jupiter rejects orders worth less than this each.
+ *
+ * Jupiter reports the limit as 50.00 USDC. The effective check sits a little
+ * lower because it values the order through a price feed, so $48 slips through
+ * today. We enforce the stated 50 rather than the observed boundary: a plan
+ * that builds today and starts failing when the feed drifts is worse than one
+ * that refuses up front.
+ */
+export const MIN_ORDER_USD = 50;
+
+/**
+ * Jupiter schedules by fixed second intervals, not calendar dates.
+ *
+ * "Monthly" is therefore 30 days, not "the 1st of each month". Over a 48-order
+ * plan the two diverge by about three weeks. For averaging purposes the exact
+ * date is immaterial -- regular spacing is the whole mechanism -- but a plan
+ * that promised the 1st cannot be delivered literally, and should say so.
+ */
+export const INTERVAL_SECONDS = {
+  daily: 86_400,
+  weekly: 604_800,
+  monthly: 2_592_000, // 30 days
+} as const;
+
+export interface DcaOrderRequest {
+  /** The wallet that will own and fund the order. A public key, never a secret. */
+  readonly user: string;
+  readonly inputMint: string;
+  readonly outputMint: string;
+  /** TOTAL deposited up front, in input base units. Split across every order. */
+  readonly totalDeposit: bigint;
+  readonly numberOfOrders: number;
+  readonly intervalSeconds: number;
+  /** Unix seconds, or omitted to begin immediately. */
+  readonly startAt?: number;
+}
+
+export interface BuiltOrder {
+  readonly requestId: string;
+  /** Base64 unsigned transaction, for the user to sign in their own wallet. */
+  readonly transaction: string;
+}
+
+export class OrderTooSmallError extends Error {
+  readonly perOrderUsd: number;
+  constructor(perOrderUsd: number) {
+    super(
+      `each order would be worth $${perOrderUsd.toFixed(2)}, below Jupiter's ` +
+        `$${MIN_ORDER_USD} minimum. Raise the budget, cut the number of legs, ` +
+        `or buy less often.`,
+    );
+    this.name = 'OrderTooSmallError';
+    this.perOrderUsd = perOrderUsd;
+  }
+}
+
+/**
+ * Ask Jupiter to build the order transaction.
+ *
+ * `inAmount` is the total deposit and must be a JSON number, not a string --
+ * the API silently rejects the string form as an unmatched enum variant, with
+ * an error that names neither the field nor the reason.
+ */
+export async function createDcaOrder(req: DcaOrderRequest): Promise<BuiltOrder> {
+  if (req.numberOfOrders < 1) throw new RangeError('numberOfOrders must be at least 1');
+  if (req.totalDeposit <= 0n) throw new RangeError('totalDeposit must be positive');
+
+  const time: Record<string, unknown> = {
+    inAmount: Number(req.totalDeposit),
+    numberOfOrders: req.numberOfOrders,
+    interval: req.intervalSeconds,
+  };
+  if (req.startAt !== undefined) time['startAt'] = req.startAt;
+
+  const res = await fetch(`${LITE}/recurring/v1/createOrder`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({
+      user: req.user,
+      inputMint: req.inputMint,
+      outputMint: req.outputMint,
+      params: { time },
+    }),
+  });
+
+  const body = (await res.json().catch(() => ({}))) as {
+    transaction?: string; requestId?: string; error?: string;
+  };
+  if (!res.ok || !body.transaction) {
+    throw new JupiterError(`createOrder failed: ${body.error ?? `HTTP ${res.status}`}`, res.status);
+  }
+  return { requestId: body.requestId ?? '', transaction: body.transaction };
+}
+
+/**
+ * Split a long plan into shorter consecutive orders.
+ *
+ * Jupiter escrows the ENTIRE deposit when the order is created, so a 48-month
+ * plan locks four years of capital today. Chunking into yearly orders cuts that
+ * commitment and gives natural points to reassess, at the cost of having to
+ * place a new order when each chunk ends.
+ */
+export function chunkPeriods(periods: number, chunkSize?: number): number[] {
+  if (periods < 1) throw new RangeError('periods must be at least 1');
+  if (chunkSize === undefined) return [periods];
+  if (chunkSize < 1) throw new RangeError('chunk size must be at least 1');
+  const out: number[] = [];
+  let left = periods;
+  while (left > 0) {
+    const take = Math.min(chunkSize, left);
+    out.push(take);
+    left -= take;
+  }
+  return out;
+}
