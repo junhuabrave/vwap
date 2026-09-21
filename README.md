@@ -34,8 +34,15 @@ node src/cli/index.ts check JUP SOL MET --per-buy 100 --total 4800
 node src/cli/index.ts plan --legs "JUP=1,SOL=1,MET=1" --budget 300 --periods 48
 ```
 
+```bash
+node src/cli/index.ts order --legs "JUP=1,SOL=1,MET=1" --budget 300 \
+  --periods 48 --chunk 12 --wallet <YOUR_PUBLIC_KEY>
+```
+
 `check` audits token identity and liquidity. `plan` builds the full schedule,
-probes the live impact curve, and prints the total expected cost.
+probes the live impact curve, and prints the total expected cost. `order` builds
+**unsigned** transactions for you to sign in your own wallet — it never signs,
+never submits, and refuses a string long enough to be a secret key.
 
 ## What it refuses to do
 
@@ -80,6 +87,23 @@ averaging over months reduces the variance of your entry price — a real benefi
 that has nothing to do with market impact. Slicing a single period's buy is
 purely an execution-cost question, and at $100 the answer is almost always no.
 
+## Three constraints the API does not advertise
+
+Found by probing the live endpoints, not from the docs:
+
+- **Minimum $50 per order.** A $500 monthly budget therefore splits ten ways at
+  most. `vwap order` validates every leg before building any of them, so a plan
+  either works whole or fails having written nothing.
+- **The whole deposit is escrowed on creation.** A 48-month plan locks four
+  years of capital today. It stays yours and cancelling returns it, but it is
+  committed. `--chunk 12` splits the plan into yearly orders, cutting what you
+  escrow now from $19.2K to $4.8K on a $400/month plan.
+- **Scheduling is by fixed 30-day intervals, not calendar dates.** Buys cannot
+  be pinned to the 1st of the month; over 48 orders they drift about 21 days
+  earlier. For averaging the date is immaterial — regular spacing is the whole
+  mechanism — but a plan that promised the 1st cannot deliver it literally, and
+  the CLI says so rather than quietly approximating.
+
 ## Findings from the live market
 
 Measured against Jupiter, September 2026:
@@ -122,16 +146,21 @@ npm run typecheck
 
 ## Status and limits
 
-Working today: Solana via Jupiter, token audit, impact measurement, slicing
-decision, schedule generation, cost estimate.
+Working today: Solana via Jupiter, end to end — token audit, impact
+measurement, slicing decision, schedule generation, cost estimate, and unsigned
+DCA order construction.
 
-Not built yet: placing the orders, EVM adapters via CoW, and VWAP schedules
-synthesised from overlapping uniform tranches — neither Jupiter's DCA orders nor
-CoW TWAP can express a non-uniform schedule directly.
+Not built yet: EVM adapters via CoW, and VWAP schedules synthesised from
+overlapping uniform tranches — neither Jupiter's DCA orders nor CoW TWAP can
+express a non-uniform schedule directly.
 
-Order placement targets **Trigger V2**, which now covers DCA alongside price
-orders. Jupiter's older Recurring API is unmaintained, so anything written
-against it would need rewriting.
+**On which Jupiter API this uses.** Jupiter's docs say DCA has moved to Trigger
+V2 and that the Recurring API is unmaintained. As of September 2026 there is no
+public `trigger/v2/*` endpoint — every path returns 404 — and
+`trigger/v1/createOrder` is limit-orders-only, requiring `maker`/`payer` and
+price params. `recurring/v1/createOrder` is the only public endpoint that builds
+a working DCA order, so that is what this uses. When Trigger V2 ships publicly,
+`venues/jupiter/orders.ts` is the only file that should need to change.
 
 Impact is measured at today's liquidity and will drift over a multi-year plan;
 the estimate is a snapshot, not a forecast. Costs exclude network fees and any
@@ -139,8 +168,9 @@ spread already reflected in the router's quote.
 
 ## Scope
 
-This is execution tooling. It does not recommend assets, and nothing it prints
-is financial advice. If you operate it for other people, keep it non-custodial —
+This is execution tooling. It builds transactions and stops: it holds no keys,
+custodies no funds, signs nothing, and submits nothing. It does not recommend
+assets, and nothing it prints is financial advice. If you operate it for other people, keep it non-custodial —
 holding other people's funds or keys is a regulated activity in most
 jurisdictions, and that is a question for a lawyer, not a README.
 
