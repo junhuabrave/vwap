@@ -150,9 +150,13 @@ Working today: Solana via Jupiter, end to end — token audit, impact
 measurement, slicing decision, schedule generation, cost estimate, and unsigned
 DCA order construction.
 
-Not built yet: EVM adapters via CoW, and VWAP schedules synthesised from
-overlapping uniform tranches — neither Jupiter's DCA orders nor CoW TWAP can
-express a non-uniform schedule directly.
+Not built yet: EVM adapters, and VWAP schedules synthesised from overlapping
+uniform tranches — neither Jupiter's DCA orders nor CoW TWAP can express a
+non-uniform schedule directly.
+
+Multi-chain is designed but unbuilt; see [docs/multichain.md](docs/multichain.md)
+for the venue capability matrix, the Safe-wallet obstacle on CoW, and why the
+plan does not wait for Jupiter's GUM.
 
 **On which Jupiter API this uses.** Jupiter's docs say DCA has moved to Trigger
 V2 and that the Recurring API is unmaintained. As of September 2026 there is no
