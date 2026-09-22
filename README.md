@@ -37,12 +37,26 @@ node src/cli/index.ts plan --legs "JUP=1,SOL=1,MET=1" --budget 300 --periods 48
 ```bash
 node src/cli/index.ts order --legs "JUP=1,SOL=1,MET=1" --budget 300 \
   --periods 48 --chunk 12 --wallet <YOUR_PUBLIC_KEY>
+
+node src/cli/index.ts emit orders/JUP-01.json   # when you are ready to sign
 ```
 
 `check` audits token identity and liquidity. `plan` builds the full schedule,
-probes the live impact curve, and prints the total expected cost. `order` builds
-**unsigned** transactions for you to sign in your own wallet — it never signs,
-never submits, and refuses a string long enough to be a secret key.
+probes the live impact curve, and prints the total expected cost. `order`
+validates the plan against Jupiter and writes durable order specs. `emit` builds
+a fresh **unsigned** transaction from a spec, to sign immediately in your own
+wallet.
+
+Nothing here signs, submits, or asks for a secret key — a base58 string long
+enough to be one is refused before anything else happens.
+
+### Why specs and not transactions
+
+A Solana transaction carries a recent blockhash and dies with it after roughly
+90 seconds. A transaction written to a file is scrap by the time anyone has read
+it, so `order` stores the *intent* and `emit` builds the transaction at the
+moment of signing. This is not a limitation being worked around — it is the only
+honest way to hand someone a transaction they will sign later.
 
 ## What it refuses to do
 

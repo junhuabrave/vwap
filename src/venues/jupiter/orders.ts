@@ -96,6 +96,35 @@ export async function createDcaOrder(req: DcaOrderRequest): Promise<BuiltOrder> 
  * commitment and gives natural points to reassess, at the cost of having to
  * place a new order when each chunk ends.
  */
+/**
+ * The durable description of an order, safe to keep on disk.
+ *
+ * Deliberately NOT the transaction. A Solana transaction carries a recent
+ * blockhash and dies with it after roughly 60-90 seconds, so a transaction
+ * written to a file is scrap by the time anyone has read it. What survives is
+ * the intent; the transaction gets rebuilt at the moment of signing.
+ */
+export interface OrderSpec {
+  readonly leg: string;
+  readonly mint: string;
+  readonly wallet: string;
+  readonly depositUsdc: string;
+  readonly numberOfOrders: number;
+  readonly intervalSeconds: number;
+  readonly startAt?: number;
+}
+
+/** Turn a spec back into the request that builds it. */
+export const requestFromSpec = (spec: OrderSpec, inputMint: string, depositRaw: bigint): DcaOrderRequest => ({
+  user: spec.wallet,
+  inputMint,
+  outputMint: spec.mint,
+  totalDeposit: depositRaw,
+  numberOfOrders: spec.numberOfOrders,
+  intervalSeconds: spec.intervalSeconds,
+  ...(spec.startAt !== undefined ? { startAt: spec.startAt } : {}),
+});
+
 export function chunkPeriods(periods: number, chunkSize?: number): number[] {
   if (periods < 1) throw new RangeError('periods must be at least 1');
   if (chunkSize === undefined) return [periods];

@@ -16,8 +16,10 @@ import type { Token } from '../core/types.ts';
 import { type JupToken } from '../venues/jupiter/client.ts';
 import { JUPITER } from '../venues/jupiter/capabilities.ts';
 import { auditToken, looksLikeMint, type TokenAudit } from '../venues/jupiter/safety.ts';
-import { OrderTooSmallError, chunkPeriods, createDcaOrder } from '../venues/jupiter/orders.ts';
-import { mkdir, writeFile } from 'node:fs/promises';
+import {
+  OrderTooSmallError, chunkPeriods, createDcaOrder, requestFromSpec, type OrderSpec,
+} from '../venues/jupiter/orders.ts';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   AmbiguousTokenError, USDC, makeQuoteFn, resolveToken, toToken,
@@ -40,11 +42,13 @@ ${bold('USAGE')}
   vwap check <token...> [--per-buy <usd>] [--total <usd>]
   vwap plan  --legs <SYM=weight,...> --budget <usd> [options]
   vwap order --legs <SYM=weight,...> --budget <usd> --wallet <pubkey> [options]
+  vwap emit  <spec.json>
 
 ${bold('COMMANDS')}
   check    Resolve tokens and audit them for identity and liquidity risk.
   plan     Build a full schedule with measured impact and slicing decisions.
-  order    Build UNSIGNED DCA transactions for you to sign in your own wallet.
+  order    Validate a plan against Jupiter and write durable order specs.
+  emit     Build a fresh UNSIGNED transaction from a spec, to sign right away.
 
 ${bold('PLAN OPTIONS')}
   --legs <spec>       Comma list, e.g. "JUP=1,SOL=1,MET=1" or mint=weight.
@@ -65,8 +69,11 @@ ${bold('NOTES')}
   Tokens may be given as tickers or mint addresses. A ticker matching more than
   one token is an error, not a guess -- pass the mint to disambiguate.
 
-  'order' builds transactions and stops. It never signs, never submits, and
-  never asks for a secret key.
+  Neither 'order' nor 'emit' signs, submits, or asks for a secret key.
+
+  Specs are durable; transactions are not. A Solana transaction dies with its
+  blockhash after roughly 90 seconds, so 'order' stores intent and 'emit'
+  builds the transaction at the moment you are ready to sign it.
 `;
 
 // Annotated explicitly: TypeScript only narrows through a never-returning
@@ -346,29 +353,59 @@ async function cmdOrder(opts: {
       });
       const name = `${jup.symbol}-${String(c + 1).padStart(2, '0')}.json`;
       const file = join(opts.out, name);
-      await writeFile(file, JSON.stringify({
+      // Persist the INTENT, never the transaction. `built` was round-tripped
+      // through Jupiter purely to prove the order is acceptable -- its
+      // blockhash is already dying and keeping it would ship scrap.
+      void built;
+      const spec: OrderSpec = {
         leg: jup.symbol, mint: jup.id, wallet: opts.wallet,
         depositUsdc: formatUnits(deposit, USDC.decimals),
         numberOfOrders: count, intervalSeconds: interval,
         ...(startAt !== undefined ? { startAt } : {}),
-        requestId: built.requestId,
-        unsignedTransaction: built.transaction,
-      }, null, 2) + '\n');
+      };
+      await writeFile(file, JSON.stringify(spec, null, 2) + '\n');
       written.push(file);
       console.log(
-        `  ${green('built')} ${bold(jup.symbol.padEnd(8))} ${usd(Number(formatUnits(deposit, USDC.decimals)))} ` +
+        `  ${green('validated')} ${bold(jup.symbol.padEnd(8))} ${usd(Number(formatUnits(deposit, USDC.decimals)))} ` +
         `over ${count} orders  ${dim(name)}`,
       );
       offset += count;
     }
   }
 
-  console.log(`\n${bold(`${written.length} unsigned transaction(s) written to ${opts.out}/`)}`);
+  console.log(`\n${bold(`${written.length} order spec(s) written to ${opts.out}/`)}`);
   console.log(dim(
-    '\nThese are UNSIGNED. Nothing has been submitted and no funds have moved.\n' +
-    'Review each one, then sign and send it from your own wallet. Place a single\n' +
-    'short order first and confirm it fills before committing the full plan.',
+    '\nEach was round-tripped through Jupiter to prove it is acceptable. Nothing\n' +
+    'has been submitted and no funds have moved.',
   ));
+  console.log(
+    `\nA Solana transaction dies with its blockhash after about 90 seconds, so the\n` +
+    `specs hold the ${bold('intent')}, not a transaction. Build one when you are ready to\n` +
+    `sign it, and sign it immediately:\n\n` +
+    `  ${cyan(`vwap emit ${join(opts.out, 'JUP-01.json')}`)}\n`,
+  );
+  console.log(dim('Place one short order first and confirm it fills before committing the rest.'));
+}
+
+async function cmdEmit(specPath: string) {
+  const spec = JSON.parse(await readFile(specPath, 'utf8')) as OrderSpec;
+  for (const field of ['leg', 'mint', 'wallet', 'depositUsdc', 'numberOfOrders', 'intervalSeconds'] as const) {
+    if (spec[field] === undefined) fail(`${specPath} is missing "${field}"`);
+  }
+  const depositRaw = parseUnits(spec.depositUsdc, USDC.decimals);
+  const built = await createDcaOrder(requestFromSpec(spec, USDC.address, depositRaw));
+
+  console.log(
+    `\n${bold(spec.leg)}  ${usd(Number(spec.depositUsdc))} over ${spec.numberOfOrders} orders ` +
+    `${dim(`(${spec.mint})`)}\n` +
+    `${dim(`wallet ${spec.wallet}`)}\n`,
+  );
+  console.log(bold('Unsigned transaction (base64):'));
+  console.log(built.transaction);
+  console.log(
+    `\n${yellow('This expires in about 90 seconds.')} Sign and send it now, or run ${cyan('emit')} again.\n` +
+    dim('Nothing has been signed or submitted by this tool.'),
+  );
 }
 
 async function main() {
@@ -389,6 +426,12 @@ async function main() {
         values['per-buy'] !== undefined ? Number(values['per-buy']) : undefined,
         values['total'] !== undefined ? Number(values['total']) : undefined,
       );
+      return;
+    }
+    if (cmd === 'emit') {
+      const { positionals } = parseArgs({ args: argv.slice(1), allowPositionals: true, options: {} });
+      const spec = positionals[0] ?? fail('usage: vwap emit <spec.json>');
+      await cmdEmit(spec);
       return;
     }
     if (cmd === 'order') {
