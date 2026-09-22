@@ -89,7 +89,7 @@ export const BPS = 10_000n;
 /** Apply a basis-point fraction, e.g. bps(1000n, 50n) -> 5n (0.50%). */
 export const bps = (value: bigint, points: bigint): bigint => mulDiv(value, points, BPS);
 
-/** Subtract a basis-point fee, e.g. 0.1% Jupiter fee. */
+/** Subtract a basis-point fee, e.g. a venue's 0.1% proportional charge. */
 export const lessBps = (value: bigint, points: bigint): bigint => value - bps(value, points);
 
 /**

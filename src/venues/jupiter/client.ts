@@ -129,14 +129,3 @@ export async function quote(params: {
   if (!raw.outAmount) throw new JupiterError('quote response missing outAmount');
   return raw;
 }
-
-/**
- * Jupiter's DCA fee, in basis points.
- *
- * 0.1% as documented for the Recurring API. Jupiter has since folded DCA into
- * Trigger V2, which unifies price orders and DCA behind one vault and deposit
- * flow; the older Recurring API is unmaintained. Re-verify this rate against
- * Trigger V2 before relying on it for order placement -- Jupiter prices limit
- * orders differently for stable pairs, and DCA may follow.
- */
-export const DCA_FEE_BPS = 10;

@@ -14,33 +14,9 @@
  * ships publicly, this is the module that changes; nothing in core/ should.
  */
 import { JupiterError } from './client.ts';
+import { MIN_ORDER_USD } from './capabilities.ts';
 
 const LITE = 'https://lite-api.jup.ag';
-
-/**
- * Jupiter rejects orders worth less than this each.
- *
- * Jupiter reports the limit as 50.00 USDC. The effective check sits a little
- * lower because it values the order through a price feed, so $48 slips through
- * today. We enforce the stated 50 rather than the observed boundary: a plan
- * that builds today and starts failing when the feed drifts is worse than one
- * that refuses up front.
- */
-export const MIN_ORDER_USD = 50;
-
-/**
- * Jupiter schedules by fixed second intervals, not calendar dates.
- *
- * "Monthly" is therefore 30 days, not "the 1st of each month". Over a 48-order
- * plan the two diverge by about three weeks. For averaging purposes the exact
- * date is immaterial -- regular spacing is the whole mechanism -- but a plan
- * that promised the 1st cannot be delivered literally, and should say so.
- */
-export const INTERVAL_SECONDS = {
-  daily: 86_400,
-  weekly: 604_800,
-  monthly: 2_592_000, // 30 days
-} as const;
 
 export interface DcaOrderRequest {
   /** The wallet that will own and fund the order. A public key, never a secret. */
