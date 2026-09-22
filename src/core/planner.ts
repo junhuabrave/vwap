@@ -11,26 +11,20 @@
  * to do with market impact. Slicing a single period's buy is purely an execution
  * cost question, and at retail size the answer is usually "don't bother".
  */
-import type { Chain, ImpactCurve, SliceDecision, Token } from './types.ts';
+import type { ImpactCurve, SliceDecision } from './types.ts';
+import type { VenueCapabilities } from './venue.ts';
 import { impactAt } from './impact.ts';
 
-/**
- * Fixed cost of one additional fill, in USD.
- *
- * This is what makes slicing chain-dependent. On Solana a fill costs a fraction
- * of a cent, so slicing is nearly free and any convexity is worth harvesting.
- * On Ethereum mainnet a fill costs dollars, which swamps the impact saved on a
- * retail-sized order and makes slicing actively wrong.
- */
-export const FILL_COST_USD: Record<Chain, number> = {
-  solana: 0.005,
-  base: 0.02,
-  arbitrum: 0.05,
-  ethereum: 4.0,
-};
-
 export interface SliceOptions {
-  readonly chain: Chain;
+  /**
+   * The venue this order would be placed on.
+   *
+   * Slicing is a venue decision, not a market one: the same curve is worth
+   * slicing where a fill costs half a cent and not worth it where a fill costs
+   * four dollars. The planner reads that cost from the venue rather than
+   * carrying a table of chains it would have to be edited to extend.
+   */
+  readonly venue: VenueCapabilities;
   /** Spend for one period, in funding base units. */
   readonly spend: bigint;
   /** USD value of that spend, for costing fixed fees. */
@@ -57,12 +51,12 @@ export interface SliceOptions {
 }
 
 export function decideSlicing(curve: ImpactCurve, opts: SliceOptions): SliceDecision {
-  const { chain, spend, spendUsd } = opts;
+  const { venue, spend, spendUsd } = opts;
   const maxParts = opts.maxParts ?? 12;
   const replenishment = opts.replenishment ?? 0.7;
   const token = curve.token;
   const single = impactAt(curve, spend);
-  const fillCost = FILL_COST_USD[chain];
+  const fillCost = venue.fixedCostPerFillUsd;
 
   const no = (reason: string, sliced = single): SliceDecision => ({
     token, parts: 1, reason,
@@ -114,8 +108,8 @@ export function decideSlicing(curve: ImpactCurve, opts: SliceOptions): SliceDeci
 
   if (best.parts === 1) {
     return no(
-      `slicing would cost more in fees (${fillCost.toFixed(3)} USD per extra fill on ${chain}) ` +
-      `than it saves in impact`,
+      `slicing would cost more in fees ($${fillCost.toFixed(3)} per extra fill on ` +
+      `${venue.label}) than it saves in impact`,
     );
   }
 

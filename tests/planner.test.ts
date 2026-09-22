@@ -3,6 +3,23 @@ import assert from 'node:assert/strict';
 import { bracketSizes, fitPowerLaw, impactAt, probeSizes } from '../src/core/impact.ts';
 import { decideSlicing } from '../src/core/planner.ts';
 import type { ImpactCurve, Token } from '../src/core/types.ts';
+import type { VenueCapabilities } from '../src/core/venue.ts';
+import { maxLegsFor } from '../src/core/venue.ts';
+
+/**
+ * Two venues identical but for the cost of a fill. Everything the planner does
+ * differently between chains should come from this one number.
+ */
+const CHEAP_VENUE: VenueCapabilities = {
+  id: 'test-cheap', label: 'Cheap venue', chain: 'solana',
+  minOrderUsd: 50, proportionalFeeBps: 10, fixedCostPerFillUsd: 0.005,
+  escrow: 'upfront', intervalSemantics: 'fixed-seconds',
+  intervalSeconds: { daily: 86_400, weekly: 604_800, monthly: 2_592_000 },
+};
+const COSTLY_VENUE: VenueCapabilities = {
+  ...CHEAP_VENUE, id: 'test-costly', label: 'Costly venue',
+  chain: 'ethereum', fixedCostPerFillUsd: 4.0,
+};
 
 const TOKEN: Token = {
   chain: 'solana', address: 'So11111111111111111111111111111111111111112',
@@ -65,7 +82,7 @@ test('the order size has a non-zero measured impact', () => {
 });
 
 test('convex impact is sliced; linear and concave are not', () => {
-  const opts = { chain: 'solana' as const, spend: SPEND, spendUsd: 100 };
+  const opts = { venue: CHEAP_VENUE, spend: SPEND, spendUsd: 100 };
 
   const convex = decideSlicing(curveWith(2.74e-4, 1.8), opts);
   assert.ok(convex.worthIt, `expected slicing, got: ${convex.reason}`);
@@ -82,37 +99,55 @@ test('convex impact is sliced; linear and concave are not', () => {
   assert.match(concave.reason, /concave/);
 });
 
-test('the same convex market is sliced on Solana but not on mainnet', () => {
-  // Identical market, identical order: only the per-fill cost differs. This is
-  // the whole argument for routing retail accumulation away from mainnet.
+test('the venue, not the market, decides whether to slice', () => {
+  // Identical curve, identical order: only the venue's per-fill cost differs.
+  // This is the whole argument for keeping retail accumulation off mainnet, and
+  // the reason the planner reads capabilities instead of a table of chains.
   const curve = curveWith(2.74e-4, 1.8);
   const spend = SPEND, spendUsd = 100;
-  assert.ok(decideSlicing(curve, { chain: 'solana', spend, spendUsd }).worthIt);
-  const mainnet = decideSlicing(curve, { chain: 'ethereum', spend, spendUsd });
-  assert.equal(mainnet.parts, 1, 'gas should swamp the saving on mainnet');
-  assert.match(mainnet.reason, /cost more in fees/);
+  assert.ok(decideSlicing(curve, { venue: CHEAP_VENUE, spend, spendUsd }).worthIt);
+  const costly = decideSlicing(curve, { venue: COSTLY_VENUE, spend, spendUsd });
+  assert.equal(costly.parts, 1, 'a $4 fill should swamp the saving');
+  assert.match(costly.reason, /cost more in fees/);
+  assert.match(costly.reason, /Costly venue/, 'the explanation should name the venue');
 });
 
-test('a bigger order on mainnet does justify slicing', () => {
+test('a bigger order justifies slicing even at $4 a fill', () => {
   // Same curve shape, 1000x the money: now the impact saved dwarfs the gas.
   const curve = curveWith(2.74e-4, 1.8);
-  const d = decideSlicing(curve, { chain: 'ethereum', spend: SPEND, spendUsd: 100_000 });
+  const d = decideSlicing(curve, { venue: COSTLY_VENUE, spend: SPEND, spendUsd: 100_000 });
   assert.ok(d.worthIt, `expected slicing at size, got: ${d.reason}`);
 });
 
+test('a new venue needs no planner change', () => {
+  // Describing a venue is enough to change the decision -- nothing in core/
+  // knows this venue exists.
+  const curve = curveWith(2.74e-4, 1.8);
+  const midCost: VenueCapabilities = { ...CHEAP_VENUE, id: 'mid', label: 'Mid', fixedCostPerFillUsd: 0.5 };
+  const d = decideSlicing(curve, { venue: midCost, spend: SPEND, spendUsd: 100 });
+  assert.ok(Number.isFinite(d.impactIfSliced));
+  assert.match(d.reason, /Mid|convex|fees/);
+});
+
+test('maxLegsFor respects the venue floor', () => {
+  assert.equal(maxLegsFor(500, CHEAP_VENUE), 10);
+  assert.equal(maxLegsFor(500, { ...CHEAP_VENUE, minOrderUsd: 5 }), 100);
+  assert.equal(maxLegsFor(500, { ...CHEAP_VENUE, minOrderUsd: 5_000 }), 0);
+});
+
 test('negligible impact short-circuits before any slicing maths', () => {
-  const d = decideSlicing(curveWith(1e-10, 1.8), { chain: 'solana', spend: SPEND, spendUsd: 100 });
+  const d = decideSlicing(curveWith(1e-10, 1.8), { venue: CHEAP_VENUE, spend: SPEND, spendUsd: 100 });
   assert.equal(d.parts, 1);
   assert.match(d.reason, /negligible/);
 });
 
 test('an unmeasurable curve never slices on a guess', () => {
   const empty: ImpactCurve = { token: TOKEN, points: [], exponent: NaN, rSquared: NaN };
-  const d = decideSlicing(empty, { chain: 'solana', spend: SPEND, spendUsd: 100 });
+  const d = decideSlicing(empty, { venue: CHEAP_VENUE, spend: SPEND, spendUsd: 100 });
   assert.equal(d.parts, 1);
   assert.equal(d.worthIt, false);
 
-  const unfittable = decideSlicing(curveWith(2.74e-4, 1.8, NaN), { chain: 'solana', spend: SPEND, spendUsd: 100 });
+  const unfittable = decideSlicing(curveWith(2.74e-4, 1.8, NaN), { venue: CHEAP_VENUE, spend: SPEND, spendUsd: 100 });
   assert.equal(unfittable.parts, 1);
   assert.match(unfittable.reason, /too flat to fit/);
 });
@@ -122,12 +157,12 @@ test('a noisy fit is not traded on', () => {
   // retail size this is routing noise with a slope, and slicing on it is a
   // coin flip dressed up as a measurement.
   const noisy = { ...curveWith(2.74e-4, 1.8), rSquared: 0.3 };
-  const d = decideSlicing(noisy, { chain: 'solana', spend: SPEND, spendUsd: 100 });
+  const d = decideSlicing(noisy, { venue: CHEAP_VENUE, spend: SPEND, spendUsd: 100 });
   assert.equal(d.parts, 1);
   assert.match(d.reason, /routing noise/);
 
   // The same curve with a clean fit does slice.
-  assert.ok(decideSlicing({ ...noisy, rSquared: 0.95 }, { chain: 'solana', spend: SPEND, spendUsd: 100 }).worthIt);
+  assert.ok(decideSlicing({ ...noisy, rSquared: 0.95 }, { venue: CHEAP_VENUE, spend: SPEND, spendUsd: 100 }).worthIt);
 });
 
 test('impactAt interpolates inside the probed range and extrapolates beyond it', () => {

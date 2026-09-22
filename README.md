@@ -136,8 +136,13 @@ src/cli/       read-only command line
 - **`core/planner.ts`** — nets impact saved against per-fill cost, which is what
   makes the slicing decision chain-dependent.
 - **`venues/jupiter/safety.ts`** — the token audit.
+- **`core/venue.ts`** — what a venue can and cannot do: order floor, fee model,
+  escrow behaviour, interval semantics. The engine reads capabilities rather
+  than knowing venues, so the planner has no table of chains in it.
 
-Adding a chain means adding an adapter, not a branch.
+Adding a chain means describing its capabilities and writing an adapter — never
+editing the planner. `core/` imports nothing from `venues/`, and the CLI's whole
+coupling to Jupiter is one line: `const VENUE = JUPITER`.
 
 ```bash
 npm test          # 28 tests, no network

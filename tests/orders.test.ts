@@ -1,8 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  INTERVAL_SECONDS, MIN_ORDER_USD, OrderTooSmallError, chunkPeriods, createDcaOrder,
-} from '../src/venues/jupiter/orders.ts';
+import { OrderTooSmallError, chunkPeriods, createDcaOrder } from '../src/venues/jupiter/orders.ts';
+import { INTERVAL_SECONDS, JUPITER, MIN_ORDER_USD } from '../src/venues/jupiter/capabilities.ts';
 import { parseUnits, splitByWeights, formatUnits } from '../src/core/money.ts';
 
 test('chunking keeps the period count exact', () => {
@@ -49,6 +48,14 @@ test('OrderTooSmallError explains the fix, not just the failure', () => {
   assert.match(err.message, /\$40\.00/);
   assert.match(err.message, new RegExp(`\\$${MIN_ORDER_USD} minimum`));
   assert.match(err.message, /Raise the budget|cut the number of legs/);
+});
+
+test('Jupiter capabilities describe what the engine needs to know', () => {
+  assert.equal(JUPITER.minOrderUsd, MIN_ORDER_USD);
+  assert.equal(JUPITER.escrow, 'upfront', 'Jupiter locks the whole deposit on creation');
+  assert.equal(JUPITER.intervalSemantics, 'fixed-seconds', 'so "the 1st" is not expressible');
+  assert.equal(JUPITER.intervalSeconds.monthly, INTERVAL_SECONDS.monthly);
+  assert.ok(JUPITER.fixedCostPerFillUsd < 0.05, 'a Solana fill is cheap enough that slicing is nearly free');
 });
 
 test('monthly is 30 days, not a calendar month', () => {

@@ -87,34 +87,34 @@ nothing to do with execution quality — and the LIT investigation already showe
 how badly a bridged asset can misrepresent itself. If cross-chain funding is
 wanted later it belongs behind its own adapter, not smuggled into the planner.
 
-## What changes in the code
+## What changed in the code — DONE
 
-`core/` stays as it is. The work is in two places:
+`VenueCapabilities` now lives in `core/venue.ts`, and the engine reads it
+instead of knowing venues:
 
-1. **Introduce an explicit `VenueAdapter` with a capability descriptor.** Today
-   the CLI imports `MIN_ORDER_USD`, `INTERVAL_SECONDS` and `DCA_FEE_BPS`
-   directly from `venues/jupiter/`. Those become fields on a descriptor the CLI
-   reads without knowing which venue it is talking to:
+- **`FILL_COST_USD` is gone from `planner.ts`.** `decideSlicing` takes a
+  `venue` and reads `fixedCostPerFillUsd` from it. The planner no longer
+  contains a table of chains that would need editing to add one.
+- **Jupiter's constants live in `venues/jupiter/capabilities.ts`** —
+  `MIN_ORDER_USD`, `INTERVAL_SECONDS`, `DCA_FEE_BPS` — assembled into a single
+  exported `JUPITER` descriptor.
+- **The CLI has exactly one line of venue coupling**: `const VENUE = JUPITER`.
+  Eleven call sites read limits, fees, escrow behaviour and interval semantics
+  through it. Supporting another chain means changing that binding, not the
+  command logic.
 
-   ```
-   interface VenueCapabilities {
-     minOrderUsd: number;
-     escrow: 'upfront' | 'per-part';
-     walletRequirement: 'any' | 'smart-contract';
-     intervalSemantics: 'fixed-seconds' | 'wall-clock';
-     proportionalFeeBps: number;
-     fixedCostPerFillUsd: number;
-     uniformSlicesOnly: boolean;
-   }
-   ```
+Two behaviours that were hardcoded now derive from capabilities, which is the
+refactor paying for itself immediately:
 
-2. **Move `FILL_COST_USD` out of `planner.ts`.** It is currently a hardcoded
-   per-chain table inside the planner — the one real venue assumption left in
-   `core/`. It should arrive from the capability descriptor instead.
+- The escrow warning only prints when `escrow === 'upfront'`. A per-part venue
+  gets the correct, different message.
+- The calendar-drift note is driven by `intervalSemantics === 'fixed-seconds'`
+  and computes drift from the venue's own interval, rather than assuming
+  Jupiter's 30 days.
 
-This refactor is worth doing **regardless of which venue comes next**, and it is
-behaviour-preserving, so it can land on its own with the existing tests as the
-safety net.
+Only dimensions with a real consumer are in the type. `walletRequirement` and
+`uniformSlicesOnly` are catalogued below but not yet fields, because nothing
+reads them — they go in when the CoW adapter needs them.
 
 ## Non-uniform schedules (the VWAP part)
 
@@ -133,8 +133,8 @@ a position large enough to need it, not because the project is called `vwap`.
 
 ## Sequencing
 
-1. **Extract the capability model.** Behaviour-preserving, useful regardless,
-   unblocks everything else.
+1. ~~**Extract the capability model.**~~ **Done.** Behaviour-preserving;
+   `core/` imports no venue and the CLI's coupling is one line.
 2. **Spike 1inch predicates.** Highest-value unknown. If EOA scheduling works,
    the EVM path stops needing a Safe and the product gets dramatically simpler.
 3. **CoW adapter**, Safe-gated, if the spike fails or as the institutional path.

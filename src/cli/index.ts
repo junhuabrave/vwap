@@ -11,19 +11,27 @@ import { parseArgs } from 'node:util';
 import { formatUnits, parseUnits, splitByWeights } from '../core/money.ts';
 import { bracketSizes, measureCurve } from '../core/impact.ts';
 import { decideSlicing } from '../core/planner.ts';
-import { iso, nextDayOfMonth, scheduleFor } from '../core/schedule.ts';
+import { SECONDS, iso, nextDayOfMonth, scheduleFor } from '../core/schedule.ts';
 import type { Token } from '../core/types.ts';
-import { DCA_FEE_BPS, type JupToken } from '../venues/jupiter/client.ts';
+import { type JupToken } from '../venues/jupiter/client.ts';
+import { JUPITER } from '../venues/jupiter/capabilities.ts';
 import { auditToken, looksLikeMint, type TokenAudit } from '../venues/jupiter/safety.ts';
-import {
-  INTERVAL_SECONDS, MIN_ORDER_USD, OrderTooSmallError, chunkPeriods, createDcaOrder,
-} from '../venues/jupiter/orders.ts';
+import { OrderTooSmallError, chunkPeriods, createDcaOrder } from '../venues/jupiter/orders.ts';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   AmbiguousTokenError, USDC, makeQuoteFn, resolveToken, toToken,
 } from '../venues/jupiter/adapter.ts';
 import { bold, cyan, dim, green, pct, red, severityMark, severityStyle, usd, yellow } from './format.ts';
+
+/**
+ * The venue this CLI places orders on.
+ *
+ * Everything below reads limits, fees and scheduling semantics from here rather
+ * than from Jupiter directly, so supporting another chain means choosing a
+ * different value -- not editing the command logic.
+ */
+const VENUE = JUPITER;
 
 const HELP = `
 ${bold('vwap')} -- plan long-horizon accumulation, non-custodially.
@@ -188,7 +196,7 @@ async function cmdPlan(opts: {
       makeQuoteFn(USDC, token, opts.slippage),
     );
     const decision = decideSlicing(curve, {
-      chain: 'solana', spend, spendUsd, maxParts: 12,
+      venue: VENUE, spend, spendUsd, maxParts: 12,
     });
 
     const impactUsd = Number.isFinite(decision.impactIfSliced)
@@ -222,7 +230,7 @@ async function cmdPlan(opts: {
     }
   }
 
-  const feeUsd = (totalUsd * DCA_FEE_BPS) / 10_000;
+  const feeUsd = (totalUsd * VENUE.proportionalFeeBps) / 10_000;
   if (opts.json) {
     console.log(JSON.stringify({
       budgetPerPeriod: opts.budget, cadence, periods: opts.periods,
@@ -231,7 +239,7 @@ async function cmdPlan(opts: {
     }, null, 2));
   } else {
     console.log(`${bold('Estimated cost over the whole plan')}`);
-    console.log(`  venue fee (${DCA_FEE_BPS}bps)   ${usd(feeUsd)}`);
+    console.log(`  venue fee (${VENUE.proportionalFeeBps}bps)   ${usd(feeUsd)}`);
     console.log(`  price impact        ${usd(totalImpactUsd)}`);
     console.log(`  ${bold('total')}               ${bold(usd(feeUsd + totalImpactUsd))}  ${dim(`(${pct((feeUsd + totalImpactUsd) / totalUsd, 2)} of deployed capital)`)}`);
     console.log(dim('\n  Excludes network fees and any spread the router already reflects in its quote.'));
@@ -263,13 +271,13 @@ async function cmdOrder(opts: {
   const budgetUsd = Number(formatUnits(budget, USDC.decimals));
   const shares = splitByWeights(budget, legSpecs.map((l) => l.weight));
   const chunks = chunkPeriods(opts.periods, opts.chunk);
-  const interval = INTERVAL_SECONDS[cadence];
+  const interval = VENUE.intervalSeconds[cadence];
 
   // Validate every leg BEFORE building anything, so a plan either works whole
   // or fails without leaving half its orders built.
   for (const [i, leg] of legSpecs.entries()) {
     const perOrderUsd = Number(formatUnits(shares[i]!, USDC.decimals));
-    if (perOrderUsd < MIN_ORDER_USD) {
+    if (perOrderUsd < VENUE.minOrderUsd) {
       const err = new OrderTooSmallError(perOrderUsd);
       fail(`${leg.query}: ${err.message}`);
     }
@@ -280,18 +288,31 @@ async function cmdOrder(opts: {
   if (chunks.length > 1) {
     console.log(dim(`split into ${chunks.length} consecutive orders of ${chunks[0]} periods each`));
   }
-  console.log(
-    `${bold('Capital escrowed now:')} ${bold(usd(firstChunkUsd))}` +
-    (chunks.length > 1 ? dim(`  (of ${usd(budgetUsd * opts.periods)} total; the rest when each chunk ends)`) : ''),
-  );
-  console.log(dim('Jupiter locks the whole deposit when the order is created. It stays yours\nand is withdrawable by cancelling, but it is committed from today.'));
-
-  if (cadence === 'monthly') {
-    const driftDays = Math.round((opts.periods * (2_629_746 - INTERVAL_SECONDS.monthly)) / 86_400);
+  if (VENUE.escrow === 'upfront') {
     console.log(
-      `\n${yellow('note')} Jupiter schedules by fixed 30-day intervals, not calendar dates, so ` +
-      `buys\n     cannot be pinned to the 1st. Over ${opts.periods} orders they drift about ` +
-      `${driftDays} days earlier.\n     For averaging the date is immaterial, but it is not what "the 1st" means.`,
+      `${bold('Capital escrowed now:')} ${bold(usd(firstChunkUsd))}` +
+      (chunks.length > 1 ? dim(`  (of ${usd(budgetUsd * opts.periods)} total; the rest when each chunk ends)`) : ''),
+    );
+    console.log(dim(
+      `${VENUE.label} locks the whole deposit when the order is created. It stays\n` +
+      'yours and is withdrawable by cancelling, but it is committed from today.',
+    ));
+  } else {
+    console.log(dim(`${VENUE.label} draws each part as it executes; nothing is locked up front.`));
+  }
+
+  // A venue that counts fixed seconds cannot honour a calendar date, so say so
+  // rather than letting a plan imply a precision it does not have.
+  if (VENUE.intervalSemantics === 'fixed-seconds' && cadence === 'monthly') {
+    const driftDays = Math.round(
+      (opts.periods * (SECONDS.monthly - VENUE.intervalSeconds.monthly)) / 86_400,
+    );
+    const days = Math.round(VENUE.intervalSeconds.monthly / 86_400);
+    console.log(
+      `\n${yellow('note')} ${VENUE.label} schedules by fixed ${days}-day intervals, not calendar ` +
+      `dates,\n     so buys cannot be pinned to the 1st. Over ${opts.periods} orders they drift ` +
+      `about ${driftDays} days\n     earlier. For averaging the date is immaterial, but it is not ` +
+      `what "the 1st" means.`,
     );
   }
   console.log();
