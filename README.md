@@ -50,6 +50,31 @@ wallet.
 Nothing here signs, submits, or asks for a secret key — a base58 string long
 enough to be one is refused before anything else happens.
 
+### Pre-flight
+
+`emit` vets the transaction before showing it to you:
+
+```
+Pre-flight (rpc api.mainnet-beta.solana.com)
+    ok   unsigned: 1 empty signature slot(s)
+    ok   blockhash is live
+    ok   wallet holds 74.276338103 SOL for fees and rent
+   FAIL  wallet holds 16.805974 USDC but this order deposits 1200
+   FAIL  simulation failed: "InvalidAccountForFee"
+
+2 blocking problem(s). Not printing the transaction — signing it would burn a fee
+to land a failure.
+```
+
+Decoding the bytes proves a transaction calls the right program with the right
+amounts. Only simulation catches a missing token account, an empty wallet, or an
+instruction that reverts — the `InvalidAccountForFee` above was a wallet address
+that could not pay fees at all, which no amount of structural checking would have
+revealed. Both checks are free and neither costs a fee.
+
+`--no-check` skips the on-chain half; `--force` prints anyway. Set `SOLANA_RPC`
+to use your own node — the public endpoint is heavily rate-limited.
+
 ### Why specs and not transactions
 
 A Solana transaction carries a recent blockhash and dies with it after roughly
@@ -166,8 +191,17 @@ npm run typecheck
 ## Status and limits
 
 Working today: Solana via Jupiter, end to end — token audit, impact
-measurement, slicing decision, schedule generation, cost estimate, and unsigned
-DCA order construction.
+measurement, slicing decision, schedule generation, cost estimate, unsigned DCA
+order construction, and pre-flight simulation against an RPC node.
+
+Still unverified: **no order built by this tool has been signed and submitted.**
+Simulation says a validator would accept it; that is not the same as having
+watched one fill. In particular `startAt` is transmitted for chunked plans but
+its behaviour is unconfirmed — if a venue ignored it, every chunk would begin at
+once and escrow the whole plan rather than the first chunk. Place one small order
+before trusting a long one. There are also no cancel, withdraw, or status
+commands yet: orders can be created here but must be managed in Jupiter's own
+interface.
 
 Not built yet: EVM adapters, and VWAP schedules synthesised from overlapping
 uniform tranches — neither Jupiter's DCA orders nor CoW TWAP can express a
