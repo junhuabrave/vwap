@@ -25,6 +25,19 @@ import {
   AmbiguousTokenError, USDC, makeQuoteFn, resolveToken, toToken,
 } from '../venues/jupiter/adapter.ts';
 import { bold, cyan, dim, green, pct, red, severityMark, severityStyle, usd, yellow } from './format.ts';
+import { decodeTransaction } from '../venues/solana/transaction.ts';
+import { blockhashValid, rpcUrl, simulate, solBalance, splBalance } from '../venues/solana/rpc.ts';
+
+/** Enough SOL to cover fees and the rent for the order's accounts. */
+const SOL_FLOOR_LAMPORTS = 20_000_000n; // 0.02 SOL
+
+const PROGRAM_LABELS: Record<string, string> = {
+  DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M: "Jupiter DCA",
+  ComputeBudget111111111111111111111111111111: 'Compute Budget',
+  TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA: 'SPL Token',
+  ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL: 'Associated Token',
+  '11111111111111111111111111111111': 'System',
+};
 
 /**
  * The venue this CLI places orders on.
@@ -42,13 +55,13 @@ ${bold('USAGE')}
   vwap check <token...> [--per-buy <usd>] [--total <usd>]
   vwap plan  --legs <SYM=weight,...> --budget <usd> [options]
   vwap order --legs <SYM=weight,...> --budget <usd> --wallet <pubkey> [options]
-  vwap emit  <spec.json>
+  vwap emit  <spec.json> [--no-check] [--force]
 
 ${bold('COMMANDS')}
   check    Resolve tokens and audit them for identity and liquidity risk.
   plan     Build a full schedule with measured impact and slicing decisions.
   order    Validate a plan against Jupiter and write durable order specs.
-  emit     Build a fresh UNSIGNED transaction from a spec, to sign right away.
+  emit     Build a fresh UNSIGNED transaction, vet it, and print it to sign.
 
 ${bold('PLAN OPTIONS')}
   --legs <spec>       Comma list, e.g. "JUP=1,SOL=1,MET=1" or mint=weight.
@@ -64,6 +77,14 @@ ${bold('ORDER OPTIONS')}
   --chunk <n>         Split into consecutive orders of n periods each, so you
                       do not escrow the whole plan at once.
   --out <dir>         Where to write the unsigned transactions.
+
+${bold('EMIT OPTIONS')}
+  --no-check          Skip the on-chain pre-flight (offline, or no RPC).
+  --force             Print the transaction even if a check failed.
+
+  Pre-flight simulates the transaction against an RPC node and checks the
+  blockhash, your SOL for fees, and your USDC balance. Set SOLANA_RPC to use
+  your own node; the public endpoint is heavily rate-limited.
 
 ${bold('NOTES')}
   Tokens may be given as tickers or mint addresses. A ticker matching more than
@@ -387,7 +408,7 @@ async function cmdOrder(opts: {
   console.log(dim('Place one short order first and confirm it fills before committing the rest.'));
 }
 
-async function cmdEmit(specPath: string) {
+async function cmdEmit(specPath: string, opts: { check: boolean; force: boolean }) {
   const spec = JSON.parse(await readFile(specPath, 'utf8')) as OrderSpec;
   for (const field of ['leg', 'mint', 'wallet', 'depositUsdc', 'numberOfOrders', 'intervalSeconds'] as const) {
     if (spec[field] === undefined) fail(`${specPath} is missing "${field}"`);
@@ -397,10 +418,80 @@ async function cmdEmit(specPath: string) {
 
   console.log(
     `\n${bold(spec.leg)}  ${usd(Number(spec.depositUsdc))} over ${spec.numberOfOrders} orders ` +
-    `${dim(`(${spec.mint})`)}\n` +
-    `${dim(`wallet ${spec.wallet}`)}\n`,
+    `${dim(`(${spec.mint})`)}\n${dim(`wallet ${spec.wallet}`)}`,
   );
-  console.log(bold('Unsigned transaction (base64):'));
+
+  // Decoding is free and local: always do it, even when checks are skipped.
+  let decoded;
+  try {
+    decoded = decodeTransaction(built.transaction);
+  } catch (err) {
+    return fail(`Jupiter returned something that will not parse as a transaction: ${String(err)}`);
+  }
+  if (!decoded.unsigned) {
+    return fail('refusing to print a transaction that already carries a signature');
+  }
+  const programs = [...new Set(decoded.programIds)]
+    .map((id) => PROGRAM_LABELS[id] ?? `${id.slice(0, 8)}...`);
+  console.log(dim(`calls: ${programs.join(', ')}`));
+
+  let blocking = 0;
+  const line = (ok: boolean | null, text: string) => {
+    if (ok === false) blocking++;
+    const mark = ok === true ? green('  ok  ') : ok === null ? yellow(' warn ') : red(' FAIL ');
+    console.log(`  ${mark} ${text}`);
+  };
+
+  console.log(`\n${bold('Pre-flight')} ${dim(`(rpc ${new URL(rpcUrl()).host})`)}`);
+  line(true, `unsigned: ${decoded.signatureSlots} empty signature slot(s)`);
+
+  if (!opts.check) {
+    console.log(dim('  ..... on-chain checks skipped (--no-check)'));
+  } else {
+    try {
+      const [fresh, lamports, usdc, sim] = await Promise.all([
+        blockhashValid(decoded.recentBlockhash),
+        solBalance(spec.wallet),
+        splBalance(spec.wallet, USDC.address),
+        simulate(built.transaction),
+      ]);
+
+      line(fresh, fresh ? 'blockhash is live' : 'blockhash already expired — re-run emit');
+      line(
+        lamports >= SOL_FLOOR_LAMPORTS ? true : null,
+        `wallet holds ${formatUnits(lamports, 9)} SOL for fees and rent` +
+          (lamports >= SOL_FLOOR_LAMPORTS ? '' : ` (under ${formatUnits(SOL_FLOOR_LAMPORTS, 9)} — may fail)`),
+      );
+      line(
+        usdc >= depositRaw,
+        usdc >= depositRaw
+          ? `wallet holds ${formatUnits(usdc, USDC.decimals)} USDC, needs ${spec.depositUsdc}`
+          : `wallet holds ${formatUnits(usdc, USDC.decimals)} USDC but this order deposits ${spec.depositUsdc}`,
+      );
+
+      if (sim.err === null) {
+        line(true, `simulated clean${sim.unitsConsumed !== undefined ? ` (${sim.unitsConsumed} compute units)` : ''}`);
+      } else {
+        line(false, `simulation failed: ${JSON.stringify(sim.err)}`);
+        const interesting = sim.logs.filter((l) => /error|fail|insufficient|panic/i.test(l)).slice(0, 4);
+        for (const l of (interesting.length > 0 ? interesting : sim.logs.slice(-4))) {
+          console.log(dim(`         ${l.slice(0, 110)}`));
+        }
+      }
+    } catch (err) {
+      line(null, `on-chain checks unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (blocking > 0 && !opts.force) {
+    console.error(
+      `\n${red(`${blocking} blocking problem(s).`)} Not printing the transaction — signing it would ` +
+      `burn a fee\nto land a failure. Fix the above, or pass ${cyan('--force')} to see it anyway.`,
+    );
+    process.exit(2);
+  }
+
+  console.log(`\n${bold('Unsigned transaction (base64):')}`);
   console.log(built.transaction);
   console.log(
     `\n${yellow('This expires in about 90 seconds.')} Sign and send it now, or run ${cyan('emit')} again.\n` +
@@ -429,9 +520,12 @@ async function main() {
       return;
     }
     if (cmd === 'emit') {
-      const { positionals } = parseArgs({ args: argv.slice(1), allowPositionals: true, options: {} });
+      const { values, positionals } = parseArgs({
+        args: argv.slice(1), allowPositionals: true,
+        options: { 'no-check': { type: 'boolean', default: false }, force: { type: 'boolean', default: false } },
+      });
       const spec = positionals[0] ?? fail('usage: vwap emit <spec.json>');
-      await cmdEmit(spec);
+      await cmdEmit(spec, { check: values['no-check'] !== true, force: values.force === true });
       return;
     }
     if (cmd === 'order') {
