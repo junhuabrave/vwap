@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vwap</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>vwap<span class="dot">.</span></h1>
+    <p class="sub">Plan and cost long-horizon accumulation.</p>
+    <span class="badge">Non-custodial — this page never sees a private key</span>
+  </header>
+
+  <section>
+    <h2>1 · Plan</h2>
+    <div class="grid">
+      <div style="grid-column: 1 / -1">
+        <label for="legs">Basket</label>
+        <input id="legs" class="mono" value="JUP=1,SOL=1,MET=1" placeholder="JUP=1,SOL=1 or a mint address">
+        <p class="hint">Tickers or mint addresses, with optional weights. A ticker matching more than one token is an error, not a guess.</p>
+      </div>
+      <div>
+        <label for="budget">Budget per period (USDC)</label>
+        <input id="budget" value="300" inputmode="decimal">
+      </div>
+      <div>
+        <label for="cadence">Cadence</label>
+        <select id="cadence">
+          <option value="monthly" selected>monthly</option>
+          <option value="weekly">weekly</option>
+          <option value="daily">daily</option>
+        </select>
+      </div>
+      <div>
+        <label for="periods">Periods</label>
+        <input id="periods" value="48" inputmode="numeric">
+      </div>
+      <div>
+        <label for="slippage">Slippage cap (bps)</label>
+        <input id="slippage" value="50" inputmode="numeric">
+      </div>
+    </div>
+    <div class="actions">
+      <button id="analyse">Analyse</button>
+      <span id="plan-status" class="muted"></span>
+    </div>
+    <p id="plan-error" class="err hidden"></p>
+  </section>
+
+  <section id="results" class="hidden">
+    <h2>2 · Measured</h2>
+    <div class="stats" id="plan-stats"></div>
+    <div id="plan-legs"></div>
+    <p class="hint" id="plan-note"></p>
+  </section>
+
+  <section id="orders" class="hidden">
+    <h2>3 · Orders</h2>
+    <div class="grid">
+      <div style="grid-column: 1 / -1">
+        <label for="wallet">Your wallet address (public key)</label>
+        <input id="wallet" class="mono" placeholder="Base58 public key — never a secret key">
+        <p class="hint">Only a public address. This tool signs nothing and has no use for a secret key.</p>
+      </div>
+      <div>
+        <label for="chunk">Chunk size (periods per order)</label>
+        <input id="chunk" value="12" inputmode="numeric">
+        <p class="hint">Blank for one order covering the whole plan.</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="build">Build order specs</button>
+      <label class="muted" style="display:flex;gap:6px;align-items:center;font-weight:400">
+        <input type="checkbox" id="validate" checked style="width:auto"> validate against the venue
+      </label>
+      <span id="order-status" class="muted"></span>
+    </div>
+    <p id="order-error" class="err hidden"></p>
+    <div id="order-out"></div>
+  </section>
+
+  <section id="emit" class="hidden">
+    <h2>4 · Sign</h2>
+    <p class="hint">A Solana transaction dies with its blockhash after about 90 seconds, so it is built here, at the moment you sign it — never stored.</p>
+    <div id="emit-out"></div>
+  </section>
+
+  <footer>
+    Running locally. Nothing on this page signs or submits a transaction; you do that in your own wallet.
+    Set <code>SOLANA_RPC</code> before starting the server to use your own node.
+  </footer>
+</div>
+<script src="/app.js" type="module"></script>
+</body>
+</html>

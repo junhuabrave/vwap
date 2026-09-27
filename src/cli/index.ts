@@ -2,51 +2,24 @@
 /**
  * vwap -- plan and cost long-horizon accumulation.
  *
- * This CLI is read-only. It resolves tokens, audits them, measures live impact,
- * and prints a schedule with its costs. It does not sign, submit, or custody
- * anything: placing the resulting orders is a deliberate act the user performs
- * in their own wallet.
+ * This CLI formats; it does not orchestrate. The sequence of resolve, audit,
+ * measure and decide lives in app/service.ts, shared with the local web UI, so
+ * the two cannot disagree about what a plan costs.
+ *
+ * Nothing here signs, submits, or asks for a secret key.
  */
 import { parseArgs } from 'node:util';
-import { formatUnits, parseUnits, splitByWeights } from '../core/money.ts';
-import { bracketSizes, measureCurve } from '../core/impact.ts';
-import { decideSlicing } from '../core/planner.ts';
-import { SECONDS, iso, nextDayOfMonth, scheduleFor } from '../core/schedule.ts';
-import type { Token } from '../core/types.ts';
-import { type JupToken } from '../venues/jupiter/client.ts';
-import { JUPITER } from '../venues/jupiter/capabilities.ts';
-import { auditToken, looksLikeMint, type TokenAudit } from '../venues/jupiter/safety.ts';
-import {
-  OrderTooSmallError, chunkPeriods, createDcaOrder, requestFromSpec, type OrderSpec,
-} from '../venues/jupiter/orders.ts';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { formatUnits } from '../core/money.ts';
+import type { OrderSpec } from '../venues/jupiter/orders.ts';
+import { auditToken, type TokenAudit } from '../venues/jupiter/safety.ts';
+import { AmbiguousTokenError, resolveToken } from '../venues/jupiter/adapter.ts';
 import {
-  AmbiguousTokenError, USDC, makeQuoteFn, resolveToken, toToken,
-} from '../venues/jupiter/adapter.ts';
+  VENUE, emitWithPreflight, orderSpecs, planReport, type PlanReport,
+} from '../app/service.ts';
+import { serve } from '../web/server.ts';
 import { bold, cyan, dim, green, pct, red, severityMark, severityStyle, usd, yellow } from './format.ts';
-import { decodeTransaction } from '../venues/solana/transaction.ts';
-import { blockhashValid, rpcUrl, simulate, solBalance, splBalance } from '../venues/solana/rpc.ts';
-
-/** Enough SOL to cover fees and the rent for the order's accounts. */
-const SOL_FLOOR_LAMPORTS = 20_000_000n; // 0.02 SOL
-
-const PROGRAM_LABELS: Record<string, string> = {
-  DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M: "Jupiter DCA",
-  ComputeBudget111111111111111111111111111111: 'Compute Budget',
-  TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA: 'SPL Token',
-  ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL: 'Associated Token',
-  '11111111111111111111111111111111': 'System',
-};
-
-/**
- * The venue this CLI places orders on.
- *
- * Everything below reads limits, fees and scheduling semantics from here rather
- * than from Jupiter directly, so supporting another chain means choosing a
- * different value -- not editing the command logic.
- */
-const VENUE = JUPITER;
 
 const HELP = `
 ${bold('vwap')} -- plan long-horizon accumulation, non-custodially.
@@ -56,12 +29,14 @@ ${bold('USAGE')}
   vwap plan  --legs <SYM=weight,...> --budget <usd> [options]
   vwap order --legs <SYM=weight,...> --budget <usd> --wallet <pubkey> [options]
   vwap emit  <spec.json> [--no-check] [--force]
+  vwap serve [--port <n>]
 
 ${bold('COMMANDS')}
   check    Resolve tokens and audit them for identity and liquidity risk.
-  plan     Build a full schedule with measured impact and slicing decisions.
-  order    Validate a plan against Jupiter and write durable order specs.
+  plan     Build a schedule with measured impact and slicing decisions.
+  order    Validate a plan against the venue and write durable order specs.
   emit     Build a fresh UNSIGNED transaction, vet it, and print it to sign.
+  serve    Run the local web UI, where a wallet can sign without copy-paste.
 
 ${bold('PLAN OPTIONS')}
   --legs <spec>       Comma list, e.g. "JUP=1,SOL=1,MET=1" or mint=weight.
@@ -76,7 +51,7 @@ ${bold('ORDER OPTIONS')}
   --wallet <pubkey>   Your PUBLIC key. Never pass a private key to this tool.
   --chunk <n>         Split into consecutive orders of n periods each, so you
                       do not escrow the whole plan at once.
-  --out <dir>         Where to write the unsigned transactions.
+  --out <dir>         Where to write the order specs.
 
 ${bold('EMIT OPTIONS')}
   --no-check          Skip the on-chain pre-flight (offline, or no RPC).
@@ -90,38 +65,28 @@ ${bold('NOTES')}
   Tokens may be given as tickers or mint addresses. A ticker matching more than
   one token is an error, not a guess -- pass the mint to disambiguate.
 
-  Neither 'order' nor 'emit' signs, submits, or asks for a secret key.
-
   Specs are durable; transactions are not. A Solana transaction dies with its
   blockhash after roughly 90 seconds, so 'order' stores intent and 'emit'
   builds the transaction at the moment you are ready to sign it.
 `;
 
-// Annotated explicitly: TypeScript only narrows through a never-returning
-// arrow function when the binding itself carries the type.
 const fail: (msg: string) => never = (msg) => {
   console.error(`${red('error')} ${msg}`);
   process.exit(1);
 };
 
-async function resolveOrExplain(query: string) {
-  try {
-    return await resolveToken(query);
-  } catch (err) {
-    if (err instanceof AmbiguousTokenError) {
-      console.error(`${red('ambiguous')} ${err.message}`);
-      process.exit(1);
-    }
-    return fail(err instanceof Error ? err.message : String(err));
+function explain(err: unknown): never {
+  if (err instanceof AmbiguousTokenError) {
+    console.error(`${red('ambiguous')} ${err.message}`);
+    process.exit(1);
   }
+  return fail(err instanceof Error ? err.message : String(err));
 }
 
 function printAudit(audit: TokenAudit, indent = '  ') {
   const t = audit.token;
-  const badge =
-    audit.verdict === 'blocked' ? red('BLOCKED')
-    : audit.verdict === 'caution' ? yellow('CAUTION')
-    : green('OK');
+  const badge = audit.verdict === 'blocked' ? red('BLOCKED')
+    : audit.verdict === 'caution' ? yellow('CAUTION') : green('OK');
   console.log(
     `${indent}${bold(t.symbol.padEnd(8))} ${badge}  ${dim(t.name)}\n` +
     `${indent}${dim(t.id)}\n` +
@@ -131,8 +96,7 @@ function printAudit(audit: TokenAudit, indent = '  ') {
     )}`,
   );
   for (const f of audit.findings) {
-    const style = severityStyle[f.severity];
-    console.log(`${indent}  ${style(severityMark[f.severity].padEnd(5))} ${f.message}`);
+    console.log(`${indent}  ${severityStyle[f.severity](severityMark[f.severity].padEnd(5))} ${f.message}`);
   }
   if (audit.findings.length === 0) console.log(`${indent}  ${dim('no findings')}`);
   console.log();
@@ -143,7 +107,7 @@ async function cmdCheck(tokens: string[], perBuyUsd?: number, totalUsd?: number)
   console.log(`\n${bold('Token audit')}\n`);
   let blocked = 0;
   for (const q of tokens) {
-    const { token, collisions } = await resolveOrExplain(q);
+    const { token, collisions } = await resolveToken(q).catch(explain);
     const audit = auditToken(token, {
       ...(perBuyUsd !== undefined ? { perBuyUsd } : {}),
       ...(totalUsd !== undefined ? { totalPositionUsd: totalUsd } : {}),
@@ -158,168 +122,47 @@ async function cmdCheck(tokens: string[], perBuyUsd?: number, totalUsd?: number)
   }
 }
 
-interface LegSpec { query: string; weight: number }
+function printPlan(r: PlanReport) {
+  console.log(`\n${bold('Plan')}  ${usd(r.budgetUsd)} ${r.cadence} x ${r.periods} = ${bold(usd(r.totalUsd))} total`);
+  console.log(dim(`first buy ${r.schedule[0]}  ...  last buy ${r.schedule[r.schedule.length - 1]}`));
+  console.log(dim(`funding ${r.fundingSymbol} on ${r.venue}, slippage cap ${r.slippageBps}bps\n`));
 
-function parseLegs(spec: string): LegSpec[] {
-  const legs = spec.split(',').map((s) => s.trim()).filter(Boolean).map((part) => {
-    const [q, w] = part.split('=');
-    if (!q) throw new Error(`bad leg: ${part}`);
-    const weight = w === undefined ? 1 : Number(w);
-    if (!(weight > 0) || !Number.isFinite(weight)) throw new Error(`bad weight in "${part}"`);
-    return { query: q.trim(), weight };
-  });
-  if (legs.length === 0) throw new Error('no legs given');
-  return legs;
-}
-
-async function cmdPlan(opts: {
-  legs: string; budget: string; cadence: string; periods: number;
-  day: number; slippage: number; json: boolean;
-}) {
-  const cadence = opts.cadence as 'daily' | 'weekly' | 'monthly';
-  if (!['daily', 'weekly', 'monthly'].includes(cadence)) fail(`bad cadence: ${opts.cadence}`);
-
-  let legSpecs: LegSpec[];
-  try { legSpecs = parseLegs(opts.legs); } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
-
-  const budget = parseUnits(opts.budget, USDC.decimals);
-  if (budget <= 0n) fail('budget must be positive');
-  const budgetUsd = Number(formatUnits(budget, USDC.decimals));
-  const totalUsd = budgetUsd * opts.periods;
-
-  const shares = splitByWeights(budget, legSpecs.map((l) => l.weight));
-
-  const startAt = cadence === 'monthly'
-    ? nextDayOfMonth(Math.floor(Date.now() / 1000), opts.day)
-    : Math.floor(Date.now() / 1000) + 60;
-  const times = scheduleFor(startAt, cadence, opts.periods);
-
-  if (!opts.json) {
-    console.log(`\n${bold('Plan')}  ${usd(budgetUsd)} ${cadence} x ${opts.periods} = ${bold(usd(totalUsd))} total`);
-    console.log(dim(`first buy ${iso(times[0]!)}  ...  last buy ${iso(times[times.length - 1]!)}`));
-    console.log(dim(`funding ${USDC.symbol} on solana, slippage cap ${opts.slippage}bps\n`));
-  }
-
-  const rows: Array<Record<string, unknown>> = [];
-  let blocked = 0;
-  let totalImpactUsd = 0;
-
-  for (const [i, leg] of legSpecs.entries()) {
-    const spend = shares[i]!;
-    const spendUsd = Number(formatUnits(spend, USDC.decimals));
-    const legTotalUsd = spendUsd * opts.periods;
-    const { token: jup, collisions } = await resolveOrExplain(leg.query);
-    const token: Token = toToken(jup);
-
-    const audit = auditToken(jup, {
-      perBuyUsd: spendUsd, totalPositionUsd: legTotalUsd, collisions,
-    });
-    if (audit.verdict === 'blocked') blocked++;
-
-    // Probe around the actual per-period spend, so the order size sits in the
-    // middle of the measured range rather than at its reference point.
-    const curve = await measureCurve(
-      token,
-      bracketSizes(spend, 2, 2, 4n),
-      makeQuoteFn(USDC, token, opts.slippage),
+  for (const l of r.legs) {
+    printAudit(l.audit);
+    console.log(
+      `    ${dim('spend')} ${usd(l.spendPerPeriodUsd)}/period  ${dim('->')} ${usd(l.legTotalUsd)} over ${r.periods}\n` +
+      `    ${dim('impact')} ${pct(l.decision.impactIfSingle)} at size` +
+      (Number.isFinite(l.exponent)
+        ? `  ${dim(`(exponent ${l.exponent.toFixed(2)}, R2 ${l.rSquared.toFixed(2)}${l.rSquared < 0.8 ? ' -- unreliable' : ''})`)}`
+        : `  ${dim('(curve too flat to fit)')}`) + '\n' +
+      `    ${dim('slicing')} ${l.decision.parts === 1 ? 'none' : cyan(`${l.decision.parts} parts`)} -- ${l.decision.reason}\n` +
+      `    ${dim('route')} ${l.route.join(' > ') || 'n/a'}\n`,
     );
-    const decision = decideSlicing(curve, {
-      venue: VENUE, spend, spendUsd, maxParts: 12,
-    });
-
-    const impactUsd = Number.isFinite(decision.impactIfSliced)
-      ? decision.impactIfSliced * spendUsd * opts.periods : 0;
-    totalImpactUsd += impactUsd;
-
-    if (opts.json) {
-      rows.push({
-        symbol: jup.symbol, mint: jup.id, weight: leg.weight,
-        spendPerPeriod: formatUnits(spend, USDC.decimals),
-        verdict: audit.verdict,
-        findings: audit.findings,
-        exponent: curve.exponent, rSquared: curve.rSquared,
-        parts: decision.parts, reason: decision.reason,
-        impactSingle: decision.impactIfSingle, impactSliced: decision.impactIfSliced,
-      });
-    } else {
-      printAudit(audit);
-      console.log(
-        `    ${dim('spend')} ${usd(spendUsd)}/period  ${dim('->')} ${usd(legTotalUsd)} over ${opts.periods}\n` +
-        `    ${dim('impact')} ${pct(decision.impactIfSingle)} at size` +
-        (Number.isFinite(curve.exponent)
-          ? `  ${dim(
-              `(exponent ${curve.exponent.toFixed(2)}, R2 ${curve.rSquared.toFixed(2)}` +
-              `${curve.rSquared < 0.8 ? ' -- unreliable' : ''})`,
-            )}`
-          : `  ${dim('(curve too flat to fit)')}`) + '\n' +
-        `    ${dim('slicing')} ${decision.parts === 1 ? 'none' : cyan(`${decision.parts} parts`)} -- ${decision.reason}\n` +
-        `    ${dim('route')} ${curve.points[0]?.routeLabels.join(' > ') ?? 'n/a'}\n`,
-      );
-    }
   }
 
-  const feeUsd = (totalUsd * VENUE.proportionalFeeBps) / 10_000;
-  if (opts.json) {
-    console.log(JSON.stringify({
-      budgetPerPeriod: opts.budget, cadence, periods: opts.periods,
-      totalUsd, schedule: times.map(iso), legs: rows,
-      estimatedFeeUsd: feeUsd, estimatedImpactUsd: totalImpactUsd,
-    }, null, 2));
-  } else {
-    console.log(`${bold('Estimated cost over the whole plan')}`);
-    console.log(`  venue fee (${VENUE.proportionalFeeBps}bps)   ${usd(feeUsd)}`);
-    console.log(`  price impact        ${usd(totalImpactUsd)}`);
-    console.log(`  ${bold('total')}               ${bold(usd(feeUsd + totalImpactUsd))}  ${dim(`(${pct((feeUsd + totalImpactUsd) / totalUsd, 2)} of deployed capital)`)}`);
-    console.log(dim('\n  Excludes network fees and any spread the router already reflects in its quote.'));
-    console.log(dim('  Impact is measured at today\'s liquidity; it will drift over a multi-year plan.\n'));
-  }
-
-  if (blocked > 0) {
-    console.error(`${red(`${blocked} token(s) blocked.`)} Fix these before placing orders.`);
-    process.exit(2);
-  }
+  console.log(`${bold('Estimated cost over the whole plan')}`);
+  console.log(`  venue fee (${VENUE.proportionalFeeBps}bps)   ${usd(r.feeUsd)}`);
+  console.log(`  price impact        ${usd(r.impactUsd)}`);
+  const total = r.feeUsd + r.impactUsd;
+  console.log(`  ${bold('total')}               ${bold(usd(total))}  ${dim(`(${pct(total / r.totalUsd, 2)} of deployed capital)`)}`);
+  console.log(dim('\n  Excludes network fees and any spread the router already reflects in its quote.'));
+  console.log(dim("  Impact is measured at today's liquidity; it will drift over a multi-year plan.\n"));
 }
 
 async function cmdOrder(opts: {
   legs: string; budget: string; cadence: string; periods: number;
   wallet: string; chunk?: number; out: string;
 }) {
-  const cadence = opts.cadence as 'daily' | 'weekly' | 'monthly';
-  if (!['daily', 'weekly', 'monthly'].includes(cadence)) fail(`bad cadence: ${opts.cadence}`);
-  // A Solana secret key is 64 bytes and base58-encodes to ~87-88 characters, so
-  // an over-long base58 string is almost certainly a secret. Check this BEFORE
-  // the generic format check, so the user gets the warning that matters.
-  if (/^[1-9A-HJ-NP-Za-km-z]{45,}$/.test(opts.wallet)) {
-    fail('that looks like a SECRET key, not a public key. Never pass a secret key to this tool -- it signs nothing and needs only your public address.');
-  }
-  if (!looksLikeMint(opts.wallet)) fail(`--wallet must be a base58 public key, got ${JSON.stringify(opts.wallet)}`);
+  const plan = await orderSpecs({ ...opts, validate: true }).catch(explain);
 
-  const legSpecs = parseLegs(opts.legs);
-  const budget = parseUnits(opts.budget, USDC.decimals);
-  const budgetUsd = Number(formatUnits(budget, USDC.decimals));
-  const shares = splitByWeights(budget, legSpecs.map((l) => l.weight));
-  const chunks = chunkPeriods(opts.periods, opts.chunk);
-  const interval = VENUE.intervalSeconds[cadence];
-
-  // Validate every leg BEFORE building anything, so a plan either works whole
-  // or fails without leaving half its orders built.
-  for (const [i, leg] of legSpecs.entries()) {
-    const perOrderUsd = Number(formatUnits(shares[i]!, USDC.decimals));
-    if (perOrderUsd < VENUE.minOrderUsd) {
-      const err = new OrderTooSmallError(perOrderUsd);
-      fail(`${leg.query}: ${err.message}`);
-    }
+  console.log(`\n${bold('Order')}  ${usd(plan.totalUsd / opts.periods)} ${opts.cadence} x ${opts.periods}`);
+  if (plan.chunks.length > 1) {
+    console.log(dim(`split into ${plan.chunks.length} consecutive orders of ${plan.chunks[0]} periods each`));
   }
-
-  const firstChunkUsd = budgetUsd * chunks[0]!;
-  console.log(`\n${bold('Order')}  ${usd(budgetUsd)} ${cadence} x ${opts.periods} across ${legSpecs.length} legs`);
-  if (chunks.length > 1) {
-    console.log(dim(`split into ${chunks.length} consecutive orders of ${chunks[0]} periods each`));
-  }
-  if (VENUE.escrow === 'upfront') {
+  if (plan.escrowsUpfront) {
     console.log(
-      `${bold('Capital escrowed now:')} ${bold(usd(firstChunkUsd))}` +
-      (chunks.length > 1 ? dim(`  (of ${usd(budgetUsd * opts.periods)} total; the rest when each chunk ends)`) : ''),
+      `${bold('Capital escrowed now:')} ${bold(usd(plan.escrowNowUsd))}` +
+      (plan.chunks.length > 1 ? dim(`  (of ${usd(plan.totalUsd)} total; the rest when each chunk ends)`) : ''),
     );
     console.log(dim(
       `${VENUE.label} locks the whole deposit when the order is created. It stays\n` +
@@ -328,183 +171,94 @@ async function cmdOrder(opts: {
   } else {
     console.log(dim(`${VENUE.label} draws each part as it executes; nothing is locked up front.`));
   }
-
-  // A venue that counts fixed seconds cannot honour a calendar date, so say so
-  // rather than letting a plan imply a precision it does not have.
-  if (VENUE.intervalSemantics === 'fixed-seconds' && cadence === 'monthly') {
-    const driftDays = Math.round(
-      (opts.periods * (SECONDS.monthly - VENUE.intervalSeconds.monthly)) / 86_400,
-    );
+  if (plan.driftDays !== null) {
     const days = Math.round(VENUE.intervalSeconds.monthly / 86_400);
     console.log(
       `\n${yellow('note')} ${VENUE.label} schedules by fixed ${days}-day intervals, not calendar ` +
       `dates,\n     so buys cannot be pinned to the 1st. Over ${opts.periods} orders they drift ` +
-      `about ${driftDays} days\n     earlier. For averaging the date is immaterial, but it is not ` +
-      `what "the 1st" means.`,
+      `about ${plan.driftDays} days\n     earlier. For averaging the date is immaterial, but it is ` +
+      `not what "the 1st" means.`,
     );
   }
   console.log();
 
   await mkdir(opts.out, { recursive: true });
+  const seen = new Map<string, number>();
   const written: string[] = [];
-
-  for (const [i, leg] of legSpecs.entries()) {
-    const { token: jup } = await resolveOrExplain(leg.query);
-    const audit = auditToken(jup, {
-      perBuyUsd: Number(formatUnits(shares[i]!, USDC.decimals)),
-      totalPositionUsd: Number(formatUnits(shares[i]!, USDC.decimals)) * opts.periods,
-    });
-    if (audit.verdict === 'blocked') {
-      printAudit(audit);
-      fail(`${jup.symbol} is blocked by the audit -- refusing to build an order for it`);
-    }
-
-    let offset = 0;
-    for (const [c, count] of chunks.entries()) {
-      const deposit = shares[i]! * BigInt(count);
-      const startAt = offset === 0 ? undefined : Math.floor(Date.now() / 1000) + offset * interval;
-      const built = await createDcaOrder({
-        user: opts.wallet,
-        inputMint: USDC.address,
-        outputMint: jup.id,
-        totalDeposit: deposit,
-        numberOfOrders: count,
-        intervalSeconds: interval,
-        ...(startAt !== undefined ? { startAt } : {}),
-      });
-      const name = `${jup.symbol}-${String(c + 1).padStart(2, '0')}.json`;
-      const file = join(opts.out, name);
-      // Persist the INTENT, never the transaction. `built` was round-tripped
-      // through Jupiter purely to prove the order is acceptable -- its
-      // blockhash is already dying and keeping it would ship scrap.
-      void built;
-      const spec: OrderSpec = {
-        leg: jup.symbol, mint: jup.id, wallet: opts.wallet,
-        depositUsdc: formatUnits(deposit, USDC.decimals),
-        numberOfOrders: count, intervalSeconds: interval,
-        ...(startAt !== undefined ? { startAt } : {}),
-      };
-      await writeFile(file, JSON.stringify(spec, null, 2) + '\n');
-      written.push(file);
-      console.log(
-        `  ${green('validated')} ${bold(jup.symbol.padEnd(8))} ${usd(Number(formatUnits(deposit, USDC.decimals)))} ` +
-        `over ${count} orders  ${dim(name)}`,
-      );
-      offset += count;
-    }
+  for (const spec of plan.specs) {
+    const n = (seen.get(spec.leg) ?? 0) + 1;
+    seen.set(spec.leg, n);
+    const name = `${spec.leg}-${String(n).padStart(2, '0')}.json`;
+    await writeFile(join(opts.out, name), JSON.stringify(spec, null, 2) + '\n');
+    written.push(name);
+    console.log(
+      `  ${green('validated')} ${bold(spec.leg.padEnd(8))} ` +
+      `${usd(Number(spec.depositUsdc))} over ${spec.numberOfOrders} orders  ${dim(name)}`,
+    );
   }
 
   console.log(`\n${bold(`${written.length} order spec(s) written to ${opts.out}/`)}`);
   console.log(dim(
-    '\nEach was round-tripped through Jupiter to prove it is acceptable. Nothing\n' +
+    '\nEach was round-tripped through the venue to prove it is acceptable. Nothing\n' +
     'has been submitted and no funds have moved.',
   ));
   console.log(
     `\nA Solana transaction dies with its blockhash after about 90 seconds, so the\n` +
     `specs hold the ${bold('intent')}, not a transaction. Build one when you are ready to\n` +
     `sign it, and sign it immediately:\n\n` +
-    `  ${cyan(`vwap emit ${join(opts.out, 'JUP-01.json')}`)}\n`,
+    `  ${cyan(`vwap emit ${join(opts.out, written[0] ?? 'SPEC.json')}`)}\n` +
+    `\nOr drive the whole flow with a connected wallet:  ${cyan('vwap serve')}\n`,
   );
   console.log(dim('Place one short order first and confirm it fills before committing the rest.'));
 }
 
 async function cmdEmit(specPath: string, opts: { check: boolean; force: boolean }) {
   const spec = JSON.parse(await readFile(specPath, 'utf8')) as OrderSpec;
-  for (const field of ['leg', 'mint', 'wallet', 'depositUsdc', 'numberOfOrders', 'intervalSeconds'] as const) {
-    if (spec[field] === undefined) fail(`${specPath} is missing "${field}"`);
-  }
-  const depositRaw = parseUnits(spec.depositUsdc, USDC.decimals);
-  const built = await createDcaOrder(requestFromSpec(spec, USDC.address, depositRaw));
+  const r = await emitWithPreflight(spec, { check: opts.check }).catch(explain);
 
   console.log(
     `\n${bold(spec.leg)}  ${usd(Number(spec.depositUsdc))} over ${spec.numberOfOrders} orders ` +
     `${dim(`(${spec.mint})`)}\n${dim(`wallet ${spec.wallet}`)}`,
   );
-
-  // Decoding is free and local: always do it, even when checks are skipped.
-  let decoded;
-  try {
-    decoded = decodeTransaction(built.transaction);
-  } catch (err) {
-    return fail(`Jupiter returned something that will not parse as a transaction: ${String(err)}`);
+  console.log(dim(`calls: ${r.programs.join(', ')}`));
+  console.log(`\n${bold('Pre-flight')} ${dim(`(rpc ${r.rpcHost})`)}`);
+  for (const c of r.checks) {
+    const mark = c.status === 'ok' ? green('  ok  ') : c.status === 'warn' ? yellow(' warn ') : red(' FAIL ');
+    console.log(`  ${mark} ${c.label}`);
+    for (const l of c.logs ?? []) console.log(dim(`         ${l.slice(0, 110)}`));
   }
-  if (!decoded.unsigned) {
-    return fail('refusing to print a transaction that already carries a signature');
-  }
-  const programs = [...new Set(decoded.programIds)]
-    .map((id) => PROGRAM_LABELS[id] ?? `${id.slice(0, 8)}...`);
-  console.log(dim(`calls: ${programs.join(', ')}`));
+  if (!opts.check) console.log(dim('  ..... on-chain checks skipped (--no-check)'));
 
-  let blocking = 0;
-  const line = (ok: boolean | null, text: string) => {
-    if (ok === false) blocking++;
-    const mark = ok === true ? green('  ok  ') : ok === null ? yellow(' warn ') : red(' FAIL ');
-    console.log(`  ${mark} ${text}`);
-  };
-
-  console.log(`\n${bold('Pre-flight')} ${dim(`(rpc ${new URL(rpcUrl()).host})`)}`);
-  line(true, `unsigned: ${decoded.signatureSlots} empty signature slot(s)`);
-
-  if (!opts.check) {
-    console.log(dim('  ..... on-chain checks skipped (--no-check)'));
-  } else {
-    try {
-      const [fresh, lamports, usdc, sim] = await Promise.all([
-        blockhashValid(decoded.recentBlockhash),
-        solBalance(spec.wallet),
-        splBalance(spec.wallet, USDC.address),
-        simulate(built.transaction),
-      ]);
-
-      line(fresh, fresh ? 'blockhash is live' : 'blockhash already expired — re-run emit');
-      line(
-        lamports >= SOL_FLOOR_LAMPORTS ? true : null,
-        `wallet holds ${formatUnits(lamports, 9)} SOL for fees and rent` +
-          (lamports >= SOL_FLOOR_LAMPORTS ? '' : ` (under ${formatUnits(SOL_FLOOR_LAMPORTS, 9)} — may fail)`),
-      );
-      line(
-        usdc >= depositRaw,
-        usdc >= depositRaw
-          ? `wallet holds ${formatUnits(usdc, USDC.decimals)} USDC, needs ${spec.depositUsdc}`
-          : `wallet holds ${formatUnits(usdc, USDC.decimals)} USDC but this order deposits ${spec.depositUsdc}`,
-      );
-
-      if (sim.err === null) {
-        line(true, `simulated clean${sim.unitsConsumed !== undefined ? ` (${sim.unitsConsumed} compute units)` : ''}`);
-      } else {
-        line(false, `simulation failed: ${JSON.stringify(sim.err)}`);
-        const interesting = sim.logs.filter((l) => /error|fail|insufficient|panic/i.test(l)).slice(0, 4);
-        for (const l of (interesting.length > 0 ? interesting : sim.logs.slice(-4))) {
-          console.log(dim(`         ${l.slice(0, 110)}`));
-        }
-      }
-    } catch (err) {
-      line(null, `on-chain checks unavailable: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  if (blocking > 0 && !opts.force) {
+  if (r.blocking > 0 && !opts.force) {
     console.error(
-      `\n${red(`${blocking} blocking problem(s).`)} Not printing the transaction — signing it would ` +
+      `\n${red(`${r.blocking} blocking problem(s).`)} Not printing the transaction — signing it would ` +
       `burn a fee\nto land a failure. Fix the above, or pass ${cyan('--force')} to see it anyway.`,
     );
     process.exit(2);
   }
 
   console.log(`\n${bold('Unsigned transaction (base64):')}`);
-  console.log(built.transaction);
+  console.log(r.transaction);
   console.log(
     `\n${yellow('This expires in about 90 seconds.')} Sign and send it now, or run ${cyan('emit')} again.\n` +
     dim('Nothing has been signed or submitted by this tool.'),
   );
 }
 
+async function cmdServe(port: number) {
+  const url = await serve(port).catch((err: unknown) =>
+    fail(`could not start the server: ${err instanceof Error ? err.message : String(err)}`));
+  console.log(`\n${bold('vwap')} is serving at ${cyan(url)}`);
+  console.log(dim(
+    'Bound to loopback only. The page connects your wallet and signs there —\n' +
+    'no signature and no secret key passes through this process.\n\nCtrl-C to stop.',
+  ));
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
-  if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') {
-    console.log(HELP); return;
-  }
+  if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') { console.log(HELP); return; }
 
   try {
     if (cmd === 'check') {
@@ -519,21 +273,42 @@ async function main() {
       );
       return;
     }
-    if (cmd === 'emit') {
-      const { values, positionals } = parseArgs({
-        args: argv.slice(1), allowPositionals: true,
-        options: { 'no-check': { type: 'boolean', default: false }, force: { type: 'boolean', default: false } },
-      });
-      const spec = positionals[0] ?? fail('usage: vwap emit <spec.json>');
-      await cmdEmit(spec, { check: values['no-check'] !== true, force: values.force === true });
-      return;
-    }
-    if (cmd === 'order') {
+
+    if (cmd === 'plan') {
       const { values } = parseArgs({
         args: argv.slice(1),
         options: {
           legs: { type: 'string' }, budget: { type: 'string' },
-          wallet: { type: 'string' },
+          cadence: { type: 'string', default: 'monthly' },
+          periods: { type: 'string', default: '48' },
+          day: { type: 'string', default: '1' },
+          slippage: { type: 'string', default: '50' },
+          json: { type: 'boolean', default: false },
+        },
+      });
+      const legs = values.legs ?? fail('--legs is required, e.g. --legs "JUP=1,SOL=1"');
+      const budget = values.budget ?? fail('--budget is required, e.g. --budget 500');
+      const report = await planReport({
+        legs, budget,
+        cadence: values.cadence ?? 'monthly',
+        periods: Number(values.periods ?? '48'),
+        dayOfMonth: Number(values.day ?? '1'),
+        slippageBps: Number(values.slippage ?? '50'),
+      }).catch(explain);
+      if (values.json === true) console.log(JSON.stringify(report, null, 2));
+      else printPlan(report);
+      if (report.blocked > 0) {
+        console.error(`${red(`${report.blocked} token(s) blocked.`)} Fix these before placing orders.`);
+        process.exit(2);
+      }
+      return;
+    }
+
+    if (cmd === 'order') {
+      const { values } = parseArgs({
+        args: argv.slice(1),
+        options: {
+          legs: { type: 'string' }, budget: { type: 'string' }, wallet: { type: 'string' },
           cadence: { type: 'string', default: 'monthly' },
           periods: { type: 'string', default: '48' },
           chunk: { type: 'string' },
@@ -552,30 +327,23 @@ async function main() {
       });
       return;
     }
-    if (cmd === 'plan') {
-      const { values } = parseArgs({
-        args: argv.slice(1),
-        options: {
-          legs: { type: 'string' }, budget: { type: 'string' },
-          cadence: { type: 'string', default: 'monthly' },
-          periods: { type: 'string', default: '48' },
-          day: { type: 'string', default: '1' },
-          slippage: { type: 'string', default: '50' },
-          json: { type: 'boolean', default: false },
-        },
+
+    if (cmd === 'emit') {
+      const { values, positionals } = parseArgs({
+        args: argv.slice(1), allowPositionals: true,
+        options: { 'no-check': { type: 'boolean', default: false }, force: { type: 'boolean', default: false } },
       });
-      const legs = values.legs ?? fail('--legs is required, e.g. --legs "JUP=1,SOL=1"');
-      const budget = values.budget ?? fail('--budget is required, e.g. --budget 500');
-      await cmdPlan({
-        legs, budget,
-        cadence: values.cadence ?? 'monthly',
-        periods: Number(values.periods ?? '48'),
-        day: Number(values.day ?? '1'),
-        slippage: Number(values.slippage ?? '50'),
-        json: values.json ?? false,
-      });
+      const spec = positionals[0] ?? fail('usage: vwap emit <spec.json>');
+      await cmdEmit(spec, { check: values['no-check'] !== true, force: values.force === true });
       return;
     }
+
+    if (cmd === 'serve') {
+      const { values } = parseArgs({ args: argv.slice(1), options: { port: { type: 'string', default: '4747' } } });
+      await cmdServe(Number(values.port ?? '4747'));
+      return;
+    }
+
     fail(`unknown command: ${cmd}`);
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err));

@@ -158,12 +158,31 @@ Measured against Jupiter, September 2026:
   refuses to slice a $100 order. The same order on Solana, same curve, slices
   happily — per-fill cost is the whole difference.
 
+## The local web UI
+
+`vwap serve` runs a page on loopback. The engine runs server-side, so the
+browser and the CLI cannot drift apart on what a plan costs; the wallet stays in
+the browser, so no signature and no secret key passes through the server
+process. There is no code path in it that signs or submits.
+
+It is deliberately plain: no framework, no build step, no runtime dependencies —
+one HTML file, one stylesheet, one ES module. Everything dynamic is escaped
+before it reaches the DOM, because token names come from an on-chain registry
+and anyone who can mint a token chooses them.
+
+**The wallet handoff is unverified.** There is no wallet extension in the
+environment this was built in, so `Sign in wallet` has never been exercised
+against a real provider. `Copy transaction` always works and is the path that
+has been tested; treat the button as a convenience that may need fixing.
+
 ## Architecture
 
 ```
-src/core/      chain-agnostic: money, schedule, impact, planner
-src/venues/    per-chain adapters (Jupiter today)
-src/cli/       read-only command line
+src/core/      chain-agnostic: money, schedule, impact, planner, venue
+src/venues/    per-chain adapters (Jupiter, Solana RPC)
+src/app/       orchestration, shared by every front end
+src/cli/       terminal front end
+src/web/       local server and browser front end
 ```
 
 - **`core/money.ts`** — all token amounts are `bigint` base units. No float ever
@@ -175,6 +194,9 @@ src/cli/       read-only command line
 - **`core/planner.ts`** — nets impact saved against per-fill cost, which is what
   makes the slicing decision chain-dependent.
 - **`venues/jupiter/safety.ts`** — the token audit.
+- **`app/service.ts`** — resolve, audit, measure, decide, as data rather than
+  printed output. The CLI formats it; the web UI serialises it. A second copy of
+  that sequence behind a UI is how two front ends start disagreeing.
 - **`core/venue.ts`** — what a venue can and cannot do: order floor, fee model,
   escrow behaviour, interval semantics. The engine reads capabilities rather
   than knowing venues, so the planner has no table of chains in it.
