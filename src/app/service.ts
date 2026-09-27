@@ -52,6 +52,17 @@ export function asCadence(value: string): Cadence {
 }
 
 export interface LegReport {
+  /** Exactly what the user typed for this leg. */
+  readonly query: string;
+  /**
+   * Whether the mint came from the user or from a ticker lookup.
+   *
+   * The distinction matters to anyone reading a result: a leg resolved by
+   * ticker displays a mint address the user never supplied, which makes a
+   * ticker-collision warning look like it is complaining about an address they
+   * chose themselves.
+   */
+  readonly resolvedBy: 'mint' | 'ticker';
   readonly symbol: string;
   readonly name: string;
   readonly mint: string;
@@ -118,7 +129,7 @@ export async function planReport(input: PlanInput): Promise<PlanReport> {
     const spendUsd = Number(formatUnits(spend, USDC.decimals));
     const legTotalUsd = spendUsd * periods;
 
-    const { token: jup, collisions } = await resolveToken(leg.query);
+    const { token: jup, collisions, resolvedBy } = await resolveToken(leg.query);
     const token: Token = toToken(jup);
     const audit = auditToken(jup, { perBuyUsd: spendUsd, totalPositionUsd: legTotalUsd, collisions });
     if (audit.verdict === 'blocked') blocked++;
@@ -134,6 +145,7 @@ export async function planReport(input: PlanInput): Promise<PlanReport> {
     impactUsd += legImpact;
 
     legs.push({
+      query: leg.query, resolvedBy,
       symbol: jup.symbol, name: jup.name, mint: jup.id, weight: leg.weight,
       spendPerPeriodUsd: spendUsd, legTotalUsd, audit, decision,
       exponent: curve.exponent, rSquared: curve.rSquared,

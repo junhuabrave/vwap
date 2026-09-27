@@ -82,13 +82,25 @@ function renderPlan(r) {
         (l.rSquared < 0.8 ? ' <span class="unreliable">— unreliable</span>' : '')
       : 'curve too flat to fit';
 
+    // Say where the mint came from. Without this, a leg resolved from a ticker
+    // shows an address the user never typed, and a collision warning reads as a
+    // complaint about an address they chose.
+    const origin = l.resolvedBy === 'mint'
+      ? `<span class="muted">by mint</span>`
+      : `<span class="muted">resolved from ticker <b>${esc(l.query)}</b></span>`;
+    const swap = l.resolvedBy === 'ticker' && l.audit.verdict === 'blocked'
+      ? `<button class="ghost" data-usemint="${esc(l.query)}" data-mint="${esc(l.mint)}">Use this mint instead</button>`
+      : '';
+
     return `<div class="leg">
       <div class="leg-head">
         <span class="sym">${esc(l.symbol)}</span>
         <span class="verdict ${esc(l.audit.verdict)}">${esc(l.audit.verdict)}</span>
         <span class="nm">${esc(l.name)}</span>
+        ${origin}
       </div>
       <div class="mint">${esc(l.mint)}</div>
+      ${swap ? `<div class="actions" style="margin-top:10px">${swap}</div>` : ''}
       <div class="measure">
         <div>spend <b>${esc(usd(l.spendPerPeriodUsd))}</b>/period → <b>${esc(usd(l.legTotalUsd))}</b> over ${esc(r.periods)}</div>
         <div>impact at size <b>${esc(pct(l.decision.impactIfSingle))}</b> <span class="muted">(${fit})</span></div>
@@ -98,6 +110,23 @@ function renderPlan(r) {
       <ul class="findings">${findings}</ul>
     </div>`;
   }).join('');
+
+  // One click to swap a colliding ticker for the mint it resolved to.
+  for (const btn of $('plan-legs').querySelectorAll('[data-usemint]')) {
+    btn.addEventListener('click', () => {
+      const field = $('legs');
+      field.value = field.value
+        .split(',')
+        .map((part) => {
+          const [q, w] = part.split('=');
+          return q.trim() === btn.dataset.usemint
+            ? btn.dataset.mint + (w === undefined ? '' : `=${w}`)
+            : part;
+        })
+        .join(',');
+      $('analyse').click();
+    });
+  }
 
   $('plan-note').textContent =
     `First buy ${r.schedule[0]}, last ${r.schedule[r.schedule.length - 1]}. ` +
